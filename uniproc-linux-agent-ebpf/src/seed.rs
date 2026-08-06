@@ -95,15 +95,28 @@ pub extern "C" fn task_names(ctx: *mut bpf_iter__task) -> i32 {
         if task.is_null() {
             return 0;
         }
-        let pid: i32 = bpf_probe_read_kernel(&(*task).pid as *const _).unwrap_or(-1);
-        let tgid: i32 = bpf_probe_read_kernel(&(*task).tgid as *const _).unwrap_or(-2);
+        // NOTE (aya migration): bpf_d_path() requires the kernel verifier to
+        // still see a *trusted*/BTF-typed pointer chain by the time it
+        // reaches the helper call. Going through bpf_probe_read_kernel()
+        // (an opaque helper call) for the intermediate mm/exe_file hops
+        // erases that trust and the verifier rejects the program
+        // ("R1 type=scalar expected=ptr_, trusted_ptr_, rcu_ptr_"). The
+        // fix is to keep the whole task->mm->exe_file->f_path chain as
+        // plain pointer dereferences (which the verifier is able to follow
+        // as direct/trusted BTF struct access on this kernel, since
+        // aya-ebpf/bpf-linker emit BTF for these types) instead of routing
+        // it through bpf_probe_read_kernel like every other read in this
+        // file. This is a real, kernel-verifier-driven behavior difference
+        // from the libbpf/BPF_CORE_READ version and is worth flagging: it
+        // means "when in doubt use bpf_probe_read_kernel" (safe default
+        // everywhere else in this port) is actually wrong for
+        // trusted-pointer-consuming helpers like bpf_d_path.
+        let pid = (*task).pid;
+        let tgid = (*task).tgid;
         if pid != tgid {
             return 0;
         }
-        let mm: *mut core::ffi::c_void = match bpf_probe_read_kernel(&(*task).mm as *const _ as *const *mut core::ffi::c_void) {
-            Ok(v) => v,
-            Err(_) => return 0,
-        };
+        let mm = (*task).mm;
         if mm.is_null() {
             return 0;
         }
@@ -111,13 +124,9 @@ pub extern "C" fn task_names(ctx: *mut bpf_iter__task) -> i32 {
         let start_time: u64 = bpf_probe_read_kernel(&(*task).start_time as *const _).unwrap_or(0);
         let mut path_buf = [0u8; 64];
 
-        let mm_typed: *mut crate::vmlinux::mm_struct = mm.cast();
-        let exe_file: *mut crate::vmlinux::file = bpf_probe_read_kernel(
-            &(*mm_typed).__bindgen_anon_1.exe_file as *const *mut crate::vmlinux::file,
-        )
-        .unwrap_or(core::ptr::null_mut());
+        let exe_file = (*mm).__bindgen_anon_1.exe_file;
         if !exe_file.is_null() {
-            let f_path = &(*exe_file).__bindgen_anon_1.f_path as *const _ as *mut core::ffi::c_void;
+            let f_path = &mut (*exe_file).__bindgen_anon_1.f_path as *mut crate::vmlinux::path;
             bpf_d_path(
                 f_path.cast(),
                 path_buf.as_mut_ptr() as *mut core::ffi::c_char,
