@@ -28,3 +28,10 @@ tokio = { version = "1.40.0", default-features = false }
 [profile.release.package.uniproc-linux-agent-ebpf]
 debug = 2
 codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

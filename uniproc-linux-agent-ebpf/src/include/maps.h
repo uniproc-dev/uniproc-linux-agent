@@ -40,6 +40,8 @@ struct machine_stats {
 struct process_stats {
     __u32 global_pid;
     __u32 local_pid;
+    __u64 mnt_ns;
+    __u64 pid_ns;
     __u64 cpu_runtime_ns;
     __u64 rss_kb;
     __u64 last_active_ns;

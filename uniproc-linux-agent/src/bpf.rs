@@ -1,14 +1,15 @@
-use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd};
-use anyhow::anyhow;
-use libbpf_rs::{MapCore, MapFlags, OpenObject};
-use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use uniproc_protocol::{MachineStats, ProcessStats};
 use crate::batch_lookup::BatchLookup;
+use crate::environment_resolver::EnvironmentResolver;
 use crate::iter_gc::IterGc;
 use crate::name_cache::NameCache;
-use crate::process_metrics_state::{ProcessMetricsState};
+use crate::process_metrics_state::ProcessMetricsState;
 use crate::seed;
+use anyhow::anyhow;
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{MapCore, MapFlags, OpenObject};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd};
+use uniproc_protocol::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats};
 
 mod prog {
     include!(concat!(env!("OUT_DIR"), "/prog.skel.rs"));
@@ -21,6 +22,7 @@ pub struct BpfAgent<'a> {
     cache: NameCache,
     batch: BatchLookup,
     metrics: ProcessMetricsState,
+    environments: EnvironmentResolver,
 }
 
 impl<'a> BpfAgent<'a> {
@@ -45,24 +47,37 @@ impl<'a> BpfAgent<'a> {
             cache: NameCache::new(names_fd),
             batch: BatchLookup::new(),
             metrics: ProcessMetricsState::new(libbpf_rs::num_possible_cpus()?),
+            environments: EnvironmentResolver::new(),
             skel,
         })
     }
 
-    pub fn collect(&mut self) -> anyhow::Result<(Vec<ProcessStats>, MachineStats)> {
+    pub fn collect(
+        &mut self,
+    ) -> anyhow::Result<(
+        Vec<ProcessStats>,
+        Vec<LinuxEnvironmentInfo>,
+        Vec<LinuxDockerContainerInfo>,
+        MachineStats,
+    )> {
         let map = &mut self.skel.maps.process_stats_map;
         let _ = self.gc.maybe_gc(map);
         let _ = self.cache.refresh(self.gc.live_pids());
 
-        let machine = match self.skel.maps.machine_stats_map
+        let machine = match self
+            .skel
+            .maps
+            .machine_stats_map
             .lookup(&0u32.to_ne_bytes(), MapFlags::ANY)
         {
             Ok(Some(bytes)) => self.metrics.read_machine_stats(&bytes),
-            _               => MachineStats::default(),
+            _ => MachineStats::default(),
         };
-        
+
         let batch = self.batch.lookup(&self.skel.maps.process_stats_map)?;
-        Ok((self.metrics.normalize(batch.iter().copied(), &self.cache), machine))
+        let processes = self.metrics.normalize(batch.iter().copied(), &self.cache);
+        let (environments, docker_containers) = self.environments.resolve(&processes);
+        Ok((processes, environments, docker_containers, machine))
     }
 
     pub fn name_cache(&self) -> &NameCache {
@@ -86,45 +101,57 @@ fn setup_mem_config(skel: &mut prog::ProgSkel) -> anyhow::Result<()> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
     let shift = (page_size.trailing_zeros() - 10) as u32;
 
-    skel.maps.shift_map
+    skel.maps
+        .shift_map
         .update(&0u32.to_ne_bytes(), &shift.to_ne_bytes(), MapFlags::ANY)?;
-    skel.maps.last_mem_update_map
-        .update(&0u32.to_ne_bytes(), &1u64.to_ne_bytes(), MapFlags::ANY)?;
+    skel.maps.last_mem_update_map.update(
+        &0u32.to_ne_bytes(),
+        &1u64.to_ne_bytes(),
+        MapFlags::ANY,
+    )?;
     Ok(())
 }
 
-fn setup_kernel_symbols(skel: &mut prog::ProgSkel) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-    use std::fs;
+const KSYM_NAMES: [&str; 4] = [
+    "_totalram_pages",
+    "vm_zone_stat",
+    "vm_node_stat",
+    "totalreserve_pages",
+];
 
-    let syms = {
-        let content = fs::read_to_string("/proc/kallsyms")?;
-        let mut map = HashMap::new();
-        for line in content.lines() {
-            let mut p = line.split_whitespace();
-            let addr = u64::from_str_radix(p.next().unwrap_or("0"), 16).unwrap_or(0);
-            let _ = p.next();
-            if let Some(name) = p.next() {
-                map.insert(name.to_string(), addr);
+fn setup_kernel_symbols(skel: &mut prog::ProgSkel) -> anyhow::Result<()> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mut addrs = [None; KSYM_NAMES.len()];
+    let mut remaining = KSYM_NAMES.len();
+
+    let file = File::open("/proc/kallsyms")?;
+    for line in BufReader::new(file).lines() {
+        if remaining == 0 {
+            break;
+        }
+        let line = line?;
+        let mut p = line.split_whitespace();
+        let addr = u64::from_str_radix(p.next().unwrap_or("0"), 16).unwrap_or(0);
+        let _ = p.next();
+        let Some(name) = p.next() else { continue };
+
+        if let Some(idx) = KSYM_NAMES.iter().position(|&n| n == name) {
+            if addrs[idx].is_none() {
+                addrs[idx] = Some(addr);
+                remaining -= 1;
             }
         }
-        map
-    };
+    }
 
-    let find = |name: &str| {
-        syms.get(name).copied()
-            .ok_or_else(|| anyhow!("Symbol {} not found", name))
-    };
-
-    let addrs = [
-        find("_totalram_pages")?,
-        find("vm_zone_stat")?,
-        find("vm_node_stat")?,
-        find("totalreserve_pages")?,
-    ];
     for (i, addr) in addrs.iter().enumerate() {
-        skel.maps.ksym_addrs_map
-            .update(&(i as u32).to_ne_bytes(), &addr.to_ne_bytes(), MapFlags::ANY)?;
+        let addr = addr.ok_or_else(|| anyhow!("Symbol {} not found", KSYM_NAMES[i]))?;
+        skel.maps.ksym_addrs_map.update(
+            &(i as u32).to_ne_bytes(),
+            &addr.to_ne_bytes(),
+            MapFlags::ANY,
+        )?;
     }
     Ok(())
 }

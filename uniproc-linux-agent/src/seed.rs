@@ -26,22 +26,21 @@ pub fn seed_existing_processes(prog_fd: RawFd) -> anyhow::Result<()> {
 }
 
 fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
-
     #[repr(C, align(8))]
     struct BpfLinkCreateAttr {
-        prog_fd:     u32,
-        target_fd:   u32,
+        prog_fd: u32,
+        target_fd: u32,
         attach_type: u32,
-        flags:       u32,
-        _pad:        [u8; 112],
+        flags: u32,
+        _pad: [u8; 112],
     }
 
     let attr = BpfLinkCreateAttr {
-        prog_fd:     prog_fd as u32,
-        target_fd:   0,
+        prog_fd: prog_fd as u32,
+        target_fd: 0,
         attach_type: BPF_TRACE_ITER,
-        flags:       0,
-        _pad:        [0; 112],
+        flags: 0,
+        _pad: [0; 112],
     };
 
     let ret = unsafe {
@@ -64,14 +63,14 @@ fn bpf_iter_create(link_fd: RawFd) -> anyhow::Result<RawFd> {
     #[repr(C, align(8))]
     struct BpfIterCreateAttr {
         link_fd: u32,
-        flags:   u32,
-        _pad:    [u8; 120],
+        flags: u32,
+        _pad: [u8; 120],
     }
 
     let attr = BpfIterCreateAttr {
         link_fd: link_fd as u32,
-        flags:   0,
-        _pad:    [0; 120],
+        flags: 0,
+        _pad: [0; 120],
     };
 
     let ret = unsafe {

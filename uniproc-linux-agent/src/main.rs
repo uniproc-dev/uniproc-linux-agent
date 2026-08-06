@@ -1,56 +1,82 @@
+use crate::bpf::BpfAgent;
+use libbpf_rs::OpenObject;
+use ogurpchik::transport::stream::adapters::vsock::{VsockAddr, VsockTransport};
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
-use libbpf_rs::OpenObject;
-use ogurpchik::node::Node;
-use ogurpchik::service_handler::ServiceHandler;
-use ogurpchik::transport::stream::adapters::vsock::{VsockAddr, VsockTransport};
+use futures::try_join;
+use ogurpchik::discovery::Scope;
+use ogurpchik::high::node::Node;
+use ogurpchik::high::service_handler::ServiceHandler;
+use ogurpchik::transport::stream::adapters::uds::UdsTransport;
 use tracing_subscriber::filter::LevelFilter;
-use uniproc_protocol::{services, AgentCodec, AgentRequest, AgentResponse, ArchivedHostRequest, HostCodec, HostResponse};
-use crate::bpf::BpfAgent;
+use uniproc_protocol::{services, LinuxCodec, ArchivedLinuxRequest, LinuxResponse};
 
-mod bpf;
-mod process_metrics_state;
-mod iter_gc;
-mod seed;
 mod batch_lookup;
+mod bpf;
+mod environment_resolver;
+mod iter_gc;
 mod name_cache;
+mod process_metrics_state;
+mod seed;
 
 #[derive(Clone)]
 struct GuestHandler {
     agent: Arc<Mutex<BpfAgent<'static>>>,
 }
 
-impl ServiceHandler<HostCodec> for GuestHandler {
-    async fn on_request<'a>(&self, req: &ArchivedHostRequest) -> anyhow::Result<HostResponse> {
+impl ServiceHandler<LinuxCodec> for GuestHandler {
+    async fn on_request<'a>(&self, req: &ArchivedLinuxRequest) -> anyhow::Result<LinuxResponse> {
         match req {
-            ArchivedHostRequest::GetReport => {
-                let (processes, machine) = self.agent.lock().unwrap().collect()?;
-                Ok(HostResponse::Report(uniproc_protocol::
-                AgentReport {
+            ArchivedLinuxRequest::GetReport => {
+                let (processes, environments, docker_containers, machine) =
+                    self.agent.lock().unwrap().collect()?;
+                Ok(LinuxResponse::Report(uniproc_protocol::LinuxReport {
                     machine,
                     processes,
+                    environments,
+                    docker_containers,
                 }))
             }
+            ArchivedLinuxRequest::Ping => Ok(LinuxResponse::Pong),
         }
     }
 }
 
-
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_max_level(LevelFilter::DEBUG).init();
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, 131072);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 131072);
+        libc::malloc_trim(0);
+    }
+
+    tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::DEBUG)
+        .init();
 
     let open_object = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
     let agent = Arc::new(Mutex::new(BpfAgent::init(open_object)?));
 
-    let _guard = Node::new()?
-        .serve::<HostCodec, _, _>(
-            VsockTransport::server(VsockAddr::SelfManaged, 5000),
-            GuestHandler { agent },
-        )
-        .publish(services::GUEST)
-        .start()
-        .await?;
+    let (_vsock_guard, _uds_guard) = try_join!(
+        Node::new()?
+            .serve::<LinuxCodec, _, _>(
+                VsockTransport::server(VsockAddr::SelfManaged, 5000),
+                GuestHandler { agent: agent.clone() },
+            )
+            .publish(services::LINUX_AGENT)
+            .start(),
+
+        Node::new()?
+            .scope(Scope::Internal)?
+            .serve::<LinuxCodec, _, _>(
+                UdsTransport::temp("uniproc"),
+                GuestHandler { agent },
+            )
+            .publish("uniproc")
+            .start(),
+    )?;
+
 
     futures::future::pending::<()>().await;
     Ok(())
