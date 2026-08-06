@@ -1,7 +1,7 @@
+use libbpf_cargo::SkeletonBuilder;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use libbpf_cargo::SkeletonBuilder;
 
 const SRC: &str = "../uniproc-linux-agent-ebpf/src/prog.bpf.c";
 const BPF_SRC_DIR: &str = "../uniproc-linux-agent-ebpf/src";

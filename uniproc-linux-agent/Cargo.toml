@@ -12,7 +12,7 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 compio = "0.18.0"
-ogurpchik = { git = "https://github.com/Tam1SH/oguRPChik", branch = "master", features = ["vsock"] }
+ogurpchik = { git = "https://github.com/Tam1SH/oguRPChik", branch = "master", features = ["vsock", "uds"] }
 libbpf-rs = "0.26.0"
 serde_json = "1.0.149"
 uniproc-protocol = { git = "https://github.com/Tam1SH/uniproc-protocol", branch = "master" }

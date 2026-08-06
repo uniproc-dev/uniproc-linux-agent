@@ -13,11 +13,13 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
     if (s) {
         s->global_pid = tgid;
         s->local_pid  = local_pid;
+        fill_process_namespaces(task, s);
     } else {
         struct process_stats new_stats = {
             .global_pid = tgid,
             .local_pid  = local_pid,
         };
+        fill_process_namespaces(task, &new_stats);
 
         bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_ANY);
     }
@@ -54,6 +56,7 @@ int handle_new_task(struct pt_regs *ctx) {
         .global_pid = tgid,
         .local_pid  = local_pid,
     };
+    fill_process_namespaces(p, &new_stats);
     bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_NOEXIST);
     return 0;
 }

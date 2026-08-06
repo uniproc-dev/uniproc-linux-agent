@@ -21,6 +21,7 @@ int seed_processes(struct bpf_iter__task *ctx) {
     };
 
     get_local_tgid(task, &new_stats.local_pid);
+    fill_process_namespaces(task, &new_stats);
 
     bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_NOEXIST);
 
