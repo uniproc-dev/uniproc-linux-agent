@@ -8,6 +8,14 @@ members = [
 default-members = [
     "uniproc-linux-agent"
 ]
+# NOTE (aya migration): uniproc-linux-agent-ebpf must stay a workspace
+# member (not a standalone crate/workspace) - aya-build's build_ebpf() shells
+# out to `cargo build --package uniproc-linux-agent-ebpf` using the *build
+# script's* inherited cwd, which only resolves if the ebpf crate is a member
+# of this same workspace. The bpfel-unknown-none / -Z build-std cross-build
+# is still handled out-of-band on a completely different target triple, so
+# in practice it doesn't unify dependency resolution with the host-target
+# uniproc-linux-agent crate in any way that matters.
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -24,10 +32,6 @@ env_logger = { version = "0.11.5", default-features = false }
 libc = { version = "0.2.159", default-features = false }
 log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
-
-[profile.release.package.uniproc-linux-agent-ebpf]
-debug = 2
-codegen-units = 1
 
 [profile.release]
 opt-level = 3

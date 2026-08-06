@@ -1,37 +1,39 @@
-use libbpf_cargo::SkeletonBuilder;
-use std::env;
-use std::fs;
+use aya_build::{build_ebpf, Package, Toolchain};
 use std::path::PathBuf;
 
-const SRC: &str = "../uniproc-linux-agent-ebpf/src/prog.bpf.c";
-const BPF_SRC_DIR: &str = "../uniproc-linux-agent-ebpf/src";
-
 fn main() {
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ebpf_dir = manifest_dir
+        .join("..")
+        .join("uniproc-linux-agent-ebpf")
+        .canonicalize()
+        .expect("uniproc-linux-agent-ebpf directory not found");
 
-    SkeletonBuilder::new()
-        .source(SRC)
-        .clang_args(["-I../uniproc-linux-agent-ebpf/src"])
-        .build_and_generate(&out_dir.join("prog.skel.rs"))
-        .unwrap();
+    watch_dir(&ebpf_dir.join("src"));
+    println!("cargo:rerun-if-changed={}", ebpf_dir.join("Cargo.toml").display());
 
-    watch_dir(BPF_SRC_DIR);
+    build_ebpf(
+        [Package {
+            name: "uniproc-linux-agent-ebpf",
+            root_dir: ebpf_dir.to_str().expect("non-utf8 path"),
+            no_default_features: false,
+            features: &[],
+        }],
+        Toolchain::default(),
+    )
+    .expect("failed to build uniproc-linux-agent-ebpf");
 }
 
-fn watch_dir(path: &str) {
-    let p = PathBuf::from(path);
-    if p.is_file() {
-        println!("cargo:rerun-if-changed={path}");
+fn watch_dir(path: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(path) else {
         return;
-    }
-    if let Ok(entries) = fs::read_dir(&p) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let ep = entry.path();
-            if ep.is_dir() {
-                watch_dir(&ep.to_string_lossy());
-            } else {
-                println!("cargo:rerun-if-changed={}", ep.to_string_lossy());
-            }
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_dir() {
+            watch_dir(&p);
+        } else {
+            println!("cargo:rerun-if-changed={}", p.display());
         }
     }
 }

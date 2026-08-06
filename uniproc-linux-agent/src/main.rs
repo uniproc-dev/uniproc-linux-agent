@@ -1,7 +1,5 @@
 use crate::bpf::BpfAgent;
-use libbpf_rs::OpenObject;
 use ogurpchik::transport::stream::adapters::vsock::{VsockAddr, VsockTransport};
-use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
 use futures::try_join;
 use ogurpchik::discovery::Scope;
@@ -21,7 +19,7 @@ mod seed;
 
 #[derive(Clone)]
 struct GuestHandler {
-    agent: Arc<Mutex<BpfAgent<'static>>>,
+    agent: Arc<Mutex<BpfAgent>>,
 }
 
 impl ServiceHandler<LinuxCodec> for GuestHandler {
@@ -55,8 +53,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(LevelFilter::DEBUG)
         .init();
 
-    let open_object = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
-    let agent = Arc::new(Mutex::new(BpfAgent::init(open_object)?));
+    let agent = Arc::new(Mutex::new(BpfAgent::init()?));
 
     let (_vsock_guard, _uds_guard) = try_join!(
         Node::new()?

@@ -1,10 +1,8 @@
-use crate::name_cache::NameCache;
-use libbpf_rs::{MapCore, MapMut};
 use rustc_hash::FxHashSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::io;
+use std::os::fd::RawFd;
+use std::os::unix::io::FromRawFd;
 
 const BPF_LINK_CREATE: i64 = 28;
 const BPF_ITER_CREATE: i64 = 33;
@@ -38,7 +36,17 @@ impl IterGc {
         &self.live_pids_buf
     }
 
-    pub fn maybe_gc(&mut self, map: &mut MapMut) -> anyhow::Result<()> {
+    /// `map_fd`/`map_keys` replace the libbpf-rs `MapMut` this used to take:
+    /// aya's HashMap doesn't expose a raw fd directly for the
+    /// BPF_MAP_DELETE_BATCH syscall, and iterating keys through aya's typed
+    /// wrapper would mean a second full copy, so the caller passes the raw
+    /// fd (from `aya::maps::MapData::fd()`) plus the already-collected
+    /// current key set (obtained via the aya HashMap's `keys()` iterator).
+    pub fn maybe_gc(
+        &mut self,
+        map_fd: RawFd,
+        map_keys: impl Iterator<Item = u32>,
+    ) -> anyhow::Result<()> {
         self.tick += 1;
         if self.tick % self.every_n_ticks != 0 {
             return Ok(());
@@ -48,19 +56,16 @@ impl IterGc {
         fill_iter_pids(self.iter_prog_fd, &mut self.live_pids_buf)?;
 
         self.stale_buf.clear();
-        for k in map.keys() {
-            let Ok(arr): Result<[u8; 4], _> = k.try_into() else {
-                continue;
-            };
-            if !self.live_pids_buf.contains(&u32::from_ne_bytes(arr)) {
-                self.stale_buf.push(arr);
+        for pid in map_keys {
+            if !self.live_pids_buf.contains(&pid) {
+                self.stale_buf.push(pid.to_ne_bytes());
             }
         }
 
         let current = self.stale_buf.len() as f32;
         self.stale_ema = (self.stale_ema * (1.0 - EMA_ALPHA) + current * EMA_ALPHA).max(current);
 
-        let target_cap = ((self.stale_ema * 1.25) as usize);
+        let target_cap = (self.stale_ema * 1.25) as usize;
         if self.stale_buf.capacity() > target_cap * 2 {
             self.stale_buf.shrink_to(target_cap);
         }
@@ -72,7 +77,7 @@ impl IterGc {
             return Ok(());
         }
 
-        batch_delete(map.as_fd().as_raw_fd(), &self.stale_buf)
+        batch_delete(map_fd, &self.stale_buf)
     }
 
     #[cfg(debug_assertions)]
@@ -245,3 +250,4 @@ fn bpf_iter_create(link_fd: RawFd) -> anyhow::Result<RawFd> {
         Ok(ret as RawFd)
     }
 }
+

@@ -197,6 +197,13 @@ pub const UNKNOWN_PROCESS_NAME: [u8; 64] = {
     buf
 };
 
+// SAFETY: both Raw* structs are #[repr(C)], made only of primitive integer
+// fields (no padding-sensitive niches, no pointers), and must stay
+// byte-compatible with the aya-ebpf-side MachineStats/ProcessStats structs
+// in uniproc-linux-agent-ebpf/src/maps.rs (field-for-field, same order).
+unsafe impl aya::Pod for RawMachineStats {}
+unsafe impl aya::Pod for RawProcessStats {}
+
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct RawMachineStats {

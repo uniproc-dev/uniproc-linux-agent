@@ -13,14 +13,14 @@ libc = { workspace = true }
 log = { workspace = true }
 compio = "0.18.0"
 ogurpchik = { git = "https://github.com/Tam1SH/oguRPChik", branch = "master", features = ["vsock", "uds"] }
-libbpf-rs = "0.26.0"
+aya = "0.14"
 serde_json = "1.0.149"
 uniproc-protocol = { git = "https://github.com/Tam1SH/uniproc-protocol", branch = "master" }
 tracing-subscriber = "0.3.22"
 futures = "0.3.32"
 
 [build-dependencies]
-libbpf-cargo = "0.26.0"
+aya-build = "0.2"
 
 [[bin]]
 name = "uniproc-linux-agent"

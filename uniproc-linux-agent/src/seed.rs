@@ -25,7 +25,7 @@ pub fn seed_existing_processes(prog_fd: RawFd) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
+pub(crate) fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
     #[repr(C, align(8))]
     struct BpfLinkCreateAttr {
         prog_fd: u32,
@@ -59,7 +59,7 @@ fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
     }
 }
 
-fn bpf_iter_create(link_fd: RawFd) -> anyhow::Result<RawFd> {
+pub(crate) fn bpf_iter_create(link_fd: RawFd) -> anyhow::Result<RawFd> {
     #[repr(C, align(8))]
     struct BpfIterCreateAttr {
         link_fd: u32,

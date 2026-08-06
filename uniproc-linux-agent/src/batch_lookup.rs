@@ -1,8 +1,7 @@
 use crate::process_metrics_state::RawProcessStats;
-use libbpf_rs::MapCore;
 use std::io;
 use std::mem::size_of;
-use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 
 const BPF_MAP_LOOKUP_BATCH: i64 = 24;
 
@@ -21,10 +20,16 @@ impl BatchLookup {
         }
     }
 
-    pub fn lookup(&mut self, map: &impl MapCore) -> anyhow::Result<&[RawProcessStats]> {
-        let map_fd = map.as_fd().as_raw_fd();
-
-        let cap = (map.max_entries() as usize).next_power_of_two();
+    /// `map_fd`/`max_entries` are pulled from the aya map handle by the
+    /// caller (aya's HashMap type has no batch-lookup API of its own, so we
+    /// keep doing this via the raw BPF_MAP_LOOKUP_BATCH syscall exactly like
+    /// the libbpf-rs version did).
+    pub fn lookup(
+        &mut self,
+        map_fd: RawFd,
+        max_entries: u32,
+    ) -> anyhow::Result<&[RawProcessStats]> {
+        let cap = (max_entries as usize).next_power_of_two();
         if self.keys_buf.len() < cap {
             self.keys_buf.resize(cap, [0u8; 4]);
             self.values_buf
