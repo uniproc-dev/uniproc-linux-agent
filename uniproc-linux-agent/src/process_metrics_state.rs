@@ -116,18 +116,53 @@ impl ProcessMetricsState {
             })
             .collect()
     }
-    pub fn read_machine_stats(&self, percpu_bytes: &[u8]) -> MachineStats {
+    /// Aggregates one entry of a `BPF_MAP_TYPE_PERCPU_ARRAY`, as returned by
+    /// `Map::lookup_percpu()`: one buffer per possible CPU.
+    ///
+    /// Counters (`busy_ns`, traffic, disk) are accumulated by the eBPF program on
+    /// whichever CPU the probe fired, so they must be summed. The memory fields
+    /// (`total_kb`/`free_kb`/`cached_kb`/`available_kb`/`used_kb`) describe the whole
+    /// machine and are overwritten wholesale by `update_mem_stats()` in the slot of
+    /// the CPU that happened to run the refresh — summing them would be nonsense, and
+    /// CPU 0 may never have run it. We therefore take them from the freshest slot,
+    /// i.e. the one with the largest `last_tsc`.
+    pub fn read_machine_stats(&self, percpu: &[Vec<u8>]) -> MachineStats {
         let stride = size_of::<RawMachineStats>();
-        if percpu_bytes.len() < stride * self.num_cpus {
+
+        if percpu.is_empty() {
+            tracing::warn!("machine_stats_map returned no per-CPU values");
             return MachineStats::default();
         }
-
-        let cpu0: &RawMachineStats = unsafe { &*(percpu_bytes.as_ptr() as *const RawMachineStats) };
+        if percpu.len() != self.num_cpus {
+            tracing::warn!(
+                "machine_stats_map returned {} per-CPU values, expected {}",
+                percpu.len(),
+                self.num_cpus
+            );
+        }
 
         let mut acc = RawMachineStats::default();
-        for cpu in 0..self.num_cpus {
-            let s: &RawMachineStats =
-                unsafe { &*(percpu_bytes.as_ptr().add(cpu * stride) as *const RawMachineStats) };
+        let mut freshest = RawMachineStats::default();
+
+        for bytes in percpu {
+            if bytes.len() < stride {
+                tracing::warn!(
+                    "machine_stats per-CPU value is {} bytes, expected at least {}",
+                    bytes.len(),
+                    stride
+                );
+                continue;
+            }
+            // SAFETY: RawMachineStats is repr(C), all-u64, so any byte pattern of
+            // sufficient length is a valid value; read unaligned since the buffer
+            // alignment is not guaranteed.
+            let s: RawMachineStats =
+                unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const RawMachineStats) };
+
+            if s.last_tsc >= freshest.last_tsc {
+                freshest = s;
+            }
+
             acc.busy_ns += s.busy_ns;
             acc.vsock_rx_bytes += s.vsock_rx_bytes;
             acc.vsock_tx_bytes += s.vsock_tx_bytes;
@@ -176,12 +211,12 @@ impl ProcessMetricsState {
             pipe_write_bytes: acc.pipe_write_bytes,
             sendfile_bytes: acc.sendfile_bytes,
 
-            last_tsc: cpu0.last_tsc,
-            total_kb: cpu0.total_kb,
-            free_kb: cpu0.free_kb,
-            cached_kb: cpu0.cached_kb,
-            available_kb: cpu0.available_kb,
-            used_kb: cpu0.used_kb,
+            last_tsc: freshest.last_tsc,
+            total_kb: freshest.total_kb,
+            free_kb: freshest.free_kb,
+            cached_kb: freshest.cached_kb,
+            available_kb: freshest.available_kb,
+            used_kb: freshest.used_kb,
         }
     }
 }

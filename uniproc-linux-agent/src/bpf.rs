@@ -64,14 +64,23 @@ impl<'a> BpfAgent<'a> {
         let _ = self.gc.maybe_gc(map);
         let _ = self.cache.refresh(self.gc.live_pids());
 
+        // machine_stats_map is a BPF_MAP_TYPE_PERCPU_ARRAY: a plain lookup() fails
+        // on it, so we must use lookup_percpu() and aggregate the per-CPU slots.
         let machine = match self
             .skel
             .maps
             .machine_stats_map
-            .lookup(&0u32.to_ne_bytes(), MapFlags::ANY)
+            .lookup_percpu(&0u32.to_ne_bytes(), MapFlags::ANY)
         {
-            Ok(Some(bytes)) => self.metrics.read_machine_stats(&bytes),
-            _ => MachineStats::default(),
+            Ok(Some(per_cpu)) => self.metrics.read_machine_stats(&per_cpu),
+            Ok(None) => {
+                tracing::warn!("machine_stats_map has no entry at key 0");
+                MachineStats::default()
+            }
+            Err(e) => {
+                tracing::error!("machine_stats_map lookup_percpu failed: {e}");
+                MachineStats::default()
+            }
         };
 
         let batch = self.batch.lookup(&self.skel.maps.process_stats_map)?;
