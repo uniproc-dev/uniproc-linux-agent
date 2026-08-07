@@ -22,6 +22,10 @@ int seed_processes(struct bpf_iter__task *ctx) {
 
     get_local_tgid(task, &new_stats.local_pid);
     fill_process_namespaces(task, &new_stats);
+    // Without this, a process that never gets scheduled while the agent is
+    // running would keep rss_kb == 0 forever: update_process_metrics() (the
+    // only other writer) only runs from the sched_stat_runtime tracepoint.
+    fill_rss_kb(task, &new_stats);
 
     bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_NOEXIST);
 
@@ -63,6 +67,14 @@ int list_processes(struct bpf_iter__task *ctx) {
     if (!BPF_CORE_READ(task, mm)) return 0;
 
     __u32 tgid = BPF_CORE_READ(task, tgid);
+
+    // Piggy-back an RSS refresh on the GC walk: processes that stay idle are
+    // never seen by the sched_stat_runtime tracepoint, so this is the only
+    // thing that keeps their rss_kb from going stale after the initial seed.
+    struct process_stats *stats = bpf_map_lookup_elem(&process_stats_map, &tgid);
+    if (stats)
+        fill_rss_kb(task, stats);
+
     bpf_seq_write(ctx->meta->seq, &tgid, sizeof(tgid));
     return 0;
 }

@@ -64,20 +64,12 @@ static __always_inline void fill_process_namespaces(struct task_struct *task,
     get_pid_ns_id(task, &stats->pid_ns);
 }
 
-static __always_inline void update_process_metrics(__u32 pid, __u64 runtime) {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-
-    __u32 flags = BPF_CORE_READ(task, flags);
-    if (flags & 0x00200000) return; // skip kernel threads
-
-    __u32 local_pid = 0;
-    if (get_local_tgid(task, &local_pid) < 0 || local_pid == 0) return;
-
-    struct process_stats *stats = bpf_map_lookup_elem(&process_stats_map, &pid);
-    if (!stats) return;
-
-    stats->cpu_runtime_ns += runtime;
-
+/// Reads the resident-set size of `task` and stores it into `stats`.
+///
+/// Works for an arbitrary task (not just `current`), so it can be called both
+/// from the sched_stat_runtime hot path and from the iter/task walkers.
+static __always_inline void fill_rss_kb(struct task_struct *task,
+                                        struct process_stats *stats) {
     struct mm_struct *mm = BPF_CORE_READ(task, mm);
     if (!mm) return;
 
@@ -96,4 +88,21 @@ static __always_inline void update_process_metrics(__u32 pid, __u64 runtime) {
     }
 
     stats->rss_kb = pages > 0 ? ((__u64)pages << shift) : 0;
+}
+
+static __always_inline void update_process_metrics(__u32 pid, __u64 runtime) {
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+    __u32 flags = BPF_CORE_READ(task, flags);
+    if (flags & 0x00200000) return; // skip kernel threads
+
+    __u32 local_pid = 0;
+    if (get_local_tgid(task, &local_pid) < 0 || local_pid == 0) return;
+
+    struct process_stats *stats = bpf_map_lookup_elem(&process_stats_map, &pid);
+    if (!stats) return;
+
+    stats->cpu_runtime_ns += runtime;
+
+    fill_rss_kb(task, stats);
 }
