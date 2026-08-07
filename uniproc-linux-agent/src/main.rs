@@ -1,15 +1,8 @@
 use crate::bpf::BpfAgent;
 use libbpf_rs::OpenObject;
-use ogurpchik::transport::stream::adapters::vsock::{VsockAddr, VsockTransport};
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
-use futures::try_join;
-use ogurpchik::discovery::Scope;
-use ogurpchik::high::node::Node;
-use ogurpchik::high::service_handler::ServiceHandler;
-use ogurpchik::transport::stream::adapters::uds::UdsTransport;
 use tracing_subscriber::filter::LevelFilter;
-use uniproc_protocol::{services, LinuxCodec, ArchivedLinuxRequest, LinuxResponse};
 
 mod batch_lookup;
 mod bpf;
@@ -17,30 +10,9 @@ mod environment_resolver;
 mod iter_gc;
 mod name_cache;
 mod process_metrics_state;
+mod report;
+mod rpc;
 mod seed;
-
-#[derive(Clone)]
-struct GuestHandler {
-    agent: Arc<Mutex<BpfAgent<'static>>>,
-}
-
-impl ServiceHandler<LinuxCodec> for GuestHandler {
-    async fn on_request<'a>(&self, req: &ArchivedLinuxRequest) -> anyhow::Result<LinuxResponse> {
-        match req {
-            ArchivedLinuxRequest::GetReport => {
-                let (processes, environments, docker_containers, machine) =
-                    self.agent.lock().unwrap().collect()?;
-                Ok(LinuxResponse::Report(uniproc_protocol::LinuxReport {
-                    machine,
-                    processes,
-                    environments,
-                    docker_containers,
-                }))
-            }
-            ArchivedLinuxRequest::Ping => Ok(LinuxResponse::Pong),
-        }
-    }
-}
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,29 +27,45 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(LevelFilter::DEBUG)
         .init();
 
+    // libbpf's skeleton borrows the OpenObject storage for as long as the skel
+    // itself lives. Leaking it is what makes the agent `'static`, which is what
+    // lets the RPC layer hand the same `Arc` to every session it accepts.
     let open_object = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
     let agent = Arc::new(Mutex::new(BpfAgent::init(open_object)?));
+    rpc::run(agent, read_shared_secret()?).await
+}
 
-    let (_vsock_guard, _uds_guard) = try_join!(
-        Node::new()?
-            .serve::<LinuxCodec, _, _>(
-                VsockTransport::server(VsockAddr::SelfManaged, 5000),
-                GuestHandler { agent: agent.clone() },
-            )
-            .publish(services::LINUX_AGENT)
-            .start(),
+/// The host writes a one-shot secret to our stdin and closes it, then uses the
+/// same bytes as the HMAC key when it dials in. It is never persisted and never
+/// appears in `/proc/*/cmdline`, unlike an argv or environment hand-off.
+///
+/// The host sends ASCII hex text and uses those same characters as the HMAC
+/// key, so we use the bytes exactly as they arrive - there is no decode step
+/// for the two sides to disagree about. The text form matters because the
+/// stream comes through `wsl.exe`, which is free to translate encodings and
+/// line endings; raw random bytes get mangled there, and the only symptom is a
+/// handshake that fails without explanation.
+///
+/// Required in every build profile. There is nothing to relax here: the host
+/// mints the key per connection, so demanding one costs a developer nothing,
+/// while accepting unauthenticated peers in debug builds would open the hole
+/// precisely on the machine where the agent is actually run by hand. Starting
+/// it manually just means piping one in: `echo -n dev | uniproc-agent`.
+fn read_shared_secret() -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
 
-        Node::new()?
-            .scope(Scope::Internal)?
-            .serve::<LinuxCodec, _, _>(
-                UdsTransport::temp("uniproc"),
-                GuestHandler { agent },
-            )
-            .publish("uniproc")
-            .start(),
-    )?;
+    let mut buf = Vec::new();
+    std::io::stdin().read_to_end(&mut buf)?;
+    // Trailing newline is whatever the writer happened to add, not key material.
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
 
-
-    futures::future::pending::<()>().await;
-    Ok(())
+    if buf.is_empty() {
+        anyhow::bail!(
+            "no shared secret on stdin: the host writes one and closes the stream before we \
+             start listening (to run by hand: `echo -n dev | uniproc-agent`)"
+        );
+    }
+    Ok(buf)
 }

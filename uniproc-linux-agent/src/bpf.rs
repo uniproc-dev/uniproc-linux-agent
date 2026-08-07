@@ -9,7 +9,7 @@ use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd};
-use uniproc_protocol::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats};
+use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats};
 
 mod prog {
     include!(concat!(env!("OUT_DIR"), "/prog.skel.rs"));
