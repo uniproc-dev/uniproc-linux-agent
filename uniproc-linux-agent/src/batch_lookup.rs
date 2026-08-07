@@ -50,7 +50,11 @@ impl BatchLookup {
         let mut in_batch_ptr: u64 = 0;
 
         loop {
-            let attr = BatchAttr {
+            // NOTE: the kernel writes `count` (and `out_batch`) back into this
+            // struct, so it must be a `mut` binding handed over as a `*mut`
+            // pointer - otherwise reading `attr.count` after the syscall reads
+            // a value the optimiser is entitled to treat as unchanged.
+            let mut attr = BatchAttr {
                 in_batch: in_batch_ptr,
                 out_batch: out_batch.as_mut_ptr() as u64,
                 keys: self.keys_buf.as_mut_ptr() as u64,
@@ -66,7 +70,7 @@ impl BatchLookup {
                 libc::syscall(
                     libc::SYS_bpf,
                     BPF_MAP_LOOKUP_BATCH,
-                    &attr as *const _ as *const libc::c_void,
+                    &mut attr as *mut _ as *mut libc::c_void,
                     size_of::<BatchAttr>() as u32,
                 )
             };
