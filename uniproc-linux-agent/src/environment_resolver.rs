@@ -18,14 +18,39 @@ struct NamespaceRep {
 }
 
 pub struct EnvironmentResolver {
-    current_mnt_ns: Option<u64>,
+    /// The pid namespace we run in. Unlike our *mount* namespace this really is
+    /// the distro's: a process started through `wsl.exe` gets a mount namespace
+    /// of its own but stays in the distro's pid namespace (`ps -p 1` shows its
+    /// systemd). Anything sharing it is this same environment, however isolated
+    /// its mounts happen to be.
+    own_pid_ns: Option<u64>,
+    /// Read once from our own filesystem. Going through
+    /// `/proc/<pid>/root/etc/os-release` instead needs ptrace-level access to
+    /// the target, which an unprivileged agent does not have for anything it
+    /// does not own.
+    distro_name: Option<String>,
 }
 
 impl EnvironmentResolver {
     pub fn new() -> Self {
         Self {
-            current_mnt_ns: read_namespace_inode(std::process::id(), "mnt"),
+            own_pid_ns: read_namespace_inode(std::process::id(), "pid"),
+            distro_name: read_local_distro_name(),
         }
+    }
+
+    /// The distro's mount namespace, i.e. the one PID 1 lives in.
+    ///
+    /// Taken from the process list rather than `/proc/1/ns/mnt`, which is
+    /// unreadable without privileges - the kernel already filled these in for
+    /// us over eBPF. `local_pid == 1` is the init of *some* pid namespace (a
+    /// container's init qualifies too), so it is only ours when the pid
+    /// namespace matches.
+    fn init_mnt_ns(&self, processes: &[ProcessStats]) -> Option<u64> {
+        processes
+            .iter()
+            .find(|p| p.local_pid == 1 && Some(p.pid_ns) == self.own_pid_ns)
+            .map(|p| p.mnt_ns)
     }
 
     pub fn resolve(
@@ -50,18 +75,31 @@ impl EnvironmentResolver {
         let mut namespace_keys: Vec<_> = namespaces.keys().copied().collect();
         namespace_keys.sort_unstable();
 
+        let init_mnt_ns = self.init_mnt_ns(processes);
+
         for mnt_ns in namespace_keys {
             let rep = namespaces[&mnt_ns];
+            // Ordered by how much the evidence is worth. Docker is positive
+            // proof from the daemon itself; the distro is an identity we can
+            // state rather than guess; the rest is decided by whether the pid
+            // namespace is ours, which is what actually separates a *different*
+            // environment from the same one merely holding its mounts apart.
             let kind = if let Some(container) = docker_by_ns.get(&mnt_ns) {
                 LinuxEnvironmentKind::DockerContainer {
                     id: container.id.clone(),
                 }
-            } else if let Some(name) = resolve_distro_name(rep.global_pid) {
-                LinuxEnvironmentKind::CurrentDistro { name }
-            } else if self.current_mnt_ns.is_some() && self.current_mnt_ns != Some(mnt_ns) {
-                LinuxEnvironmentKind::UnknownExternalNamespace
-            } else {
+            } else if init_mnt_ns == Some(mnt_ns) {
+                match &self.distro_name {
+                    Some(name) => LinuxEnvironmentKind::CurrentDistro { name: name.clone() },
+                    None => LinuxEnvironmentKind::Unknown,
+                }
+            } else if self.own_pid_ns.is_some() && Some(rep.pid_ns) == self.own_pid_ns {
+                // Same pid namespace as us: a systemd unit hardened with
+                // PrivateTmp=/ProtectSystem= gets a private mount namespace,
+                // but it is not a separate environment - it is this one.
                 LinuxEnvironmentKind::Unknown
+            } else {
+                LinuxEnvironmentKind::UnknownExternalNamespace
             };
 
             environments.push(LinuxEnvironmentInfo {
@@ -159,11 +197,17 @@ fn docker_get(path: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(body.to_vec())?)
 }
 
-fn resolve_distro_name(pid: u32) -> Option<String> {
-    for path in [
-        format!("/proc/{pid}/root/etc/os-release"),
-        format!("/proc/{pid}/root/usr/lib/os-release"),
-    ] {
+/// The distro we are running in, read straight off our own filesystem.
+///
+/// This used to probe `/proc/<pid>/root/etc/os-release` of an arbitrary
+/// process picked per namespace, which was wrong twice over: reading another
+/// user's `/proc/<pid>/root` needs ptrace-level access, so success depended on
+/// who happened to own that process; and every hardened systemd unit still sees
+/// the real `/etc/os-release`, so a hit proved nothing about the namespace
+/// being the distro. In practice that handed the distro's identity to whichever
+/// namespace happened to have a representative we could read.
+fn read_local_distro_name() -> Option<String> {
+    for path in ["/etc/os-release", "/usr/lib/os-release"] {
         let Ok(content) = fs::read_to_string(path) else {
             continue;
         };

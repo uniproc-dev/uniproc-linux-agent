@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
 /// same bytes as the HMAC key when it dials in. It is never persisted and never
 /// appears in `/proc/*/cmdline`, unlike an argv or environment hand-off.
 ///
+/// The host sends ASCII hex text and uses those same characters as the HMAC
+/// key, so we use the bytes exactly as they arrive - there is no decode step
+/// for the two sides to disagree about. The text form matters because the
+/// stream comes through `wsl.exe`, which is free to translate encodings and
+/// line endings; raw random bytes get mangled there, and the only symptom is a
+/// handshake that fails without explanation.
+///
 /// Required in every build profile. There is nothing to relax here: the host
 /// mints the key per connection, so demanding one costs a developer nothing,
 /// while accepting unauthenticated peers in debug builds would open the hole
