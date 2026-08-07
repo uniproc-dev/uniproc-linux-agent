@@ -47,5 +47,15 @@ jobs:
       # Anything that needs a live BPF program loaded (which needs
       # CAP_BPF and a kernel with BTF) cannot run on a hosted runner and is
       # marked #[ignore]; this only covers the pure-userspace tests.
+      #
+      # .cargo/config.toml sets `runner = "sudo -E"` so that locally run
+      # tests get the capabilities the agent needs. That breaks here: sudo
+      # strips LD_* from the environment even with -E, and the proc-macro
+      # crate's test binary links libstd dynamically, so it dies with
+      # "libstd-*.so: cannot open shared object file". Nothing that runs on
+      # this job needs privileges, so override the runner with `env`, which
+      # execs the binary unchanged.
       - name: Test
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: env
         run: cargo test --workspace
