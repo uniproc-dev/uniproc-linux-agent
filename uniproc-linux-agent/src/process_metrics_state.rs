@@ -1,7 +1,7 @@
 use crate::name_cache::NameCache;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Instant;
-use uniproc_protocol::{MachineStats, ProcessStats};
+use crate::report::{MachineStats, ProcessStats};
 
 struct ProcHistory {
     cpu_runtime_ns: u64,

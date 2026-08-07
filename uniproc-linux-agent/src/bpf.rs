@@ -9,7 +9,9 @@ use aya::maps::{Array, HashMap as AyaHashMap, Map, MapData, PerCpuArray};
 use aya::programs::{FExit, Iter, KProbe, TracePoint};
 use aya::{Btf, EbpfLoader};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
-use uniproc_protocol::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats};
+use crate::report::{
+    LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats,
+};
 
 pub struct BpfAgent {
     ebpf: aya::Ebpf,

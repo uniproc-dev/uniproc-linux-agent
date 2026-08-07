@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 
 use rustc_hash::FxHashMap;
 use serde_json::Value;
-use uniproc_protocol::{
+use crate::report::{
     LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind, ProcessStats,
 };
 
