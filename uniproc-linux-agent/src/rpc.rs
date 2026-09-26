@@ -6,6 +6,7 @@
 //! clients, but nothing consumes it - anything running inside the VM can read
 //! the same data straight from /proc.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -64,7 +65,6 @@ impl linux_agent::Server for AgentImpl {
     }
 }
 
-/// Every report is a fresh sample, so there is never a payload worth an etag.
 fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_etag(0);
     meta.set_status(ResponseStatus::Ok);
@@ -100,6 +100,7 @@ async fn serve_loop(
     agent: Arc<Mutex<BpfAgent<'static>>>,
     handshake: HandshakeMode,
 ) -> Result<()> {
+    let live = Rc::new(Cell::new(0usize));
     loop {
         let session = match accept_session::<linux_agent::Client, _>(
             &listener,
@@ -117,10 +118,16 @@ async fn serve_loop(
                 continue;
             }
         };
-        // A stalled session must not hold the next client in its handshake.
+        live.set(live.get() + 1);
+        let live = live.clone();
         compio::runtime::spawn(async move {
             if let Err(e) = session.wait().await {
                 tracing::warn!("rpc session ended: {e:?}");
+            }
+            live.set(live.get() - 1);
+            if live.get() == 0 {
+                tracing::info!("last host session ended, exiting");
+                std::process::exit(0);
             }
         })
         .detach();
