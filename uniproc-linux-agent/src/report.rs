@@ -38,6 +38,7 @@ pub struct MachineStats {
     pub pipe_read_bytes: u64,
     pub pipe_write_bytes: u64,
     pub sendfile_bytes: u64,
+    pub cpu_count: u32,
 }
 
 #[derive(Debug, Clone)]

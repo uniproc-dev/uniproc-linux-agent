@@ -210,6 +210,7 @@ impl ProcessMetricsState {
             pipe_read_bytes: acc.pipe_read_bytes,
             pipe_write_bytes: acc.pipe_write_bytes,
             sendfile_bytes: acc.sendfile_bytes,
+            cpu_count: self.num_cpus as u32,
 
             last_tsc: freshest.last_tsc,
             total_kb: freshest.total_kb,

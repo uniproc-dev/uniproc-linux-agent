@@ -10,21 +10,20 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use ogurpchik::auth::handshake::HandshakeMode;
+use ogurpchik::auth::handshake::{HandshakeMode, SchemaId};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::accept_session;
 use uniproc_protocol::linux_capnp::{self, EnvironmentKind, linux_agent};
+use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
+use uniproc_protocol::{LINUX_SCHEMA_ID, WSL_AGENT_VSOCK_PORT};
 
 use crate::bpf::BpfAgent;
 use crate::report::{
     LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind, MachineStats,
     ProcessStats,
 };
-
-/// vsock port the host dials — unchanged from the previous stack.
-pub const VSOCK_PORT: u32 = 5000;
 
 #[derive(Clone)]
 struct AgentImpl {
@@ -35,8 +34,9 @@ impl linux_agent::Server for AgentImpl {
     async fn ping(
         self: Rc<Self>,
         _: linux_agent::PingParams,
-        _: linux_agent::PingResults,
+        mut results: linux_agent::PingResults,
     ) -> std::result::Result<(), capnp::Error> {
+        uncacheable(results.get().init_meta());
         Ok(())
     }
 
@@ -51,15 +51,23 @@ impl linux_agent::Server for AgentImpl {
             .unwrap()
             .collect()
             .map_err(|e| capnp::Error::failed(format!("collect failed: {e:#}")))?;
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
         build_report(
             &machine,
             &processes,
             &environments,
             &docker_containers,
-            results.get().init_report(),
+            out.init_report(),
         );
         Ok(())
     }
+}
+
+/// Every report is a fresh sample, so there is never a payload worth an etag.
+fn uncacheable(mut meta: response_meta::Builder) {
+    meta.set_etag(0);
+    meta.set_status(ResponseStatus::Ok);
 }
 
 pub async fn run(agent: Arc<Mutex<BpfAgent<'static>>>, secret: Vec<u8>) -> Result<()> {
@@ -73,15 +81,14 @@ pub async fn run(agent: Arc<Mutex<BpfAgent<'static>>>, secret: Vec<u8>) -> Resul
     // On Linux the listen-side target is ignored (binds VMADDR_CID_ANY).
     let vsock = Endpoint::Vsock {
         target: VsockTarget::Cid(0),
-        port: VSOCK_PORT,
+        port: WSL_AGENT_VSOCK_PORT,
     };
 
     // Failing to bind most likely means something else already holds the port -
     // worth being loud about, since that is exactly what an impostor would do.
-    let vsock_listener = vsock
-        .listen()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind vsock port {VSOCK_PORT}: {e:?}"))?;
+    let vsock_listener = vsock.listen().await.map_err(|e| {
+        anyhow::anyhow!("failed to bind vsock port {WSL_AGENT_VSOCK_PORT}: {e:?}")
+    })?;
 
     tracing::info!(%vsock, "listening");
 
@@ -97,6 +104,7 @@ async fn serve_loop(
         let session = match accept_session::<linux_agent::Client, _>(
             &listener,
             &handshake,
+            SchemaId(LINUX_SCHEMA_ID),
             AgentImpl {
                 agent: agent.clone(),
             },
@@ -109,10 +117,13 @@ async fn serve_loop(
                 continue;
             }
         };
-        // One connection at a time; a disconnect must not kill the loop.
-        if let Err(e) = session.wait().await {
-            tracing::warn!("rpc session ended: {e:?}");
-        }
+        // A stalled session must not hold the next client in its handshake.
+        compio::runtime::spawn(async move {
+            if let Err(e) = session.wait().await {
+                tracing::warn!("rpc session ended: {e:?}");
+            }
+        })
+        .detach();
     }
 }
 
@@ -236,6 +247,7 @@ fn build_machine_stats(m: &MachineStats, mut out: linux_capnp::machine_stats::Bu
     out.set_pipe_read_bytes(m.pipe_read_bytes);
     out.set_pipe_write_bytes(m.pipe_write_bytes);
     out.set_sendfile_bytes(m.sendfile_bytes);
+    out.set_cpu_count(m.cpu_count);
 }
 
 /// Kernel task names are NUL-padded fixed buffers; expose the &str up to the
