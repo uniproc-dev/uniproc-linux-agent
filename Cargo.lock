@@ -1101,8 +1101,8 @@ dependencies = [
 
 [[package]]
 name = "ogurpchik"
-version = "0.6.2"
-source = "git+https://github.com/uniproc-dev/oguRPChik?tag=v0.6.2#85a13fccf31e49487508674d06f3849846bd33d1"
+version = "0.6.3"
+source = "git+https://github.com/uniproc-dev/oguRPChik?tag=v0.6.3#0d61d28bb427d15823f274e7626d076d8f25b9be"
 dependencies = [
  "base64",
  "binrw",
@@ -1613,7 +1613,7 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "uniproc-linux-agent"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "capnp",

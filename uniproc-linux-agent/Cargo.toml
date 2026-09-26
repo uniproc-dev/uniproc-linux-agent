@@ -1,6 +1,6 @@
 [package]
 name = "uniproc-linux-agent"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 
 license.workspace = true
@@ -12,7 +12,7 @@ env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 compio = "0.18.0"
-ogurpchik = { git = "https://github.com/uniproc-dev/oguRPChik", tag = "v0.6.2" }
+ogurpchik = { git = "https://github.com/uniproc-dev/oguRPChik", tag = "v0.6.3" }
 libbpf-rs = "0.26.0"
 serde_json = "1.0.149"
 uniproc-protocol = { git = "https://github.com/uniproc-dev/uniproc-protocol", tag = "v0.9.0" }
