@@ -8,7 +8,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use ogurpchik::auth::handshake::{HandshakeMode, SchemaId};
@@ -20,15 +19,12 @@ use uniproc_protocol::linux_capnp::{self, EnvironmentKind, linux_agent};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
 use uniproc_protocol::{LINUX_SCHEMA_ID, WSL_AGENT_VSOCK_PORT};
 
-use crate::bpf::BpfAgent;
-use crate::report::{
-    LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind, MachineStats,
-    ProcessStats,
-};
+use crate::feed::Latest;
+use crate::report::{LinuxEnvironmentKind, MachineStats, Report};
 
 #[derive(Clone)]
 struct AgentImpl {
-    agent: Arc<Mutex<BpfAgent<'static>>>,
+    latest: Latest,
 }
 
 impl linux_agent::Server for AgentImpl {
@@ -43,24 +39,23 @@ impl linux_agent::Server for AgentImpl {
 
     async fn get_report(
         self: Rc<Self>,
-        _: linux_agent::GetReportParams,
+        params: linux_agent::GetReportParams,
         mut results: linux_agent::GetReportResults,
     ) -> std::result::Result<(), capnp::Error> {
-        let (processes, environments, docker_containers, machine) = self
-            .agent
-            .lock()
-            .unwrap()
-            .collect()
-            .map_err(|e| capnp::Error::failed(format!("collect failed: {e:#}")))?;
+        let if_none_match = params.get()?.get_meta()?.get_if_none_match();
+        let current = self
+            .latest
+            .get()
+            .map_err(|e| capnp::Error::failed(format!("collect failed: {e}")))?;
         let mut out = results.get();
-        uncacheable(out.reborrow().init_meta());
-        build_report(
-            &machine,
-            &processes,
-            &environments,
-            &docker_containers,
-            out.init_report(),
-        );
+        let mut meta = out.reborrow().init_meta();
+        meta.set_etag(current.etag);
+        if current.unchanged_since(if_none_match) {
+            meta.set_status(ResponseStatus::NotModified);
+            return Ok(());
+        }
+        meta.set_status(ResponseStatus::Ok);
+        build_report(&current.value, out.init_report());
         Ok(())
     }
 }
@@ -70,7 +65,7 @@ fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_status(ResponseStatus::Ok);
 }
 
-pub async fn run(agent: Arc<Mutex<BpfAgent<'static>>>, secret: Vec<u8>) -> Result<()> {
+pub async fn run(latest: Latest, secret: Vec<u8>) -> Result<()> {
     // vsock carries no peer identity across the VM boundary - `getpeername`
     // yields a CID, and a PID from another kernel would be meaningless - so
     // `HandshakeMode::signed_process` cannot work here at all; it refuses this
@@ -92,14 +87,10 @@ pub async fn run(agent: Arc<Mutex<BpfAgent<'static>>>, secret: Vec<u8>) -> Resul
 
     tracing::info!(%vsock, "listening");
 
-    serve_loop(vsock_listener, agent, handshake).await
+    serve_loop(vsock_listener, latest, handshake).await
 }
 
-async fn serve_loop(
-    listener: Listener,
-    agent: Arc<Mutex<BpfAgent<'static>>>,
-    handshake: HandshakeMode,
-) -> Result<()> {
+async fn serve_loop(listener: Listener, latest: Latest, handshake: HandshakeMode) -> Result<()> {
     let live = Rc::new(Cell::new(0usize));
     loop {
         let session = match accept_session::<linux_agent::Client, _>(
@@ -107,7 +98,7 @@ async fn serve_loop(
             &handshake,
             SchemaId(LINUX_SCHEMA_ID),
             AgentImpl {
-                agent: agent.clone(),
+                latest: latest.clone(),
             },
         )
         .await
@@ -134,15 +125,10 @@ async fn serve_loop(
     }
 }
 
-fn build_report(
-    machine: &MachineStats,
-    processes: &[ProcessStats],
-    environments: &[LinuxEnvironmentInfo],
-    docker_containers: &[LinuxDockerContainerInfo],
-    mut out: linux_capnp::report::Builder,
-) {
-    build_machine_stats(machine, out.reborrow().init_machine());
+fn build_report(report: &Report, mut out: linux_capnp::report::Builder) {
+    build_machine_stats(&report.machine, out.reborrow().init_machine());
 
+    let processes = &report.processes;
     let mut list = out.reborrow().init_processes(processes.len() as u32);
     for (i, p) in processes.iter().enumerate() {
         let mut dst = list.reborrow().get(i as u32);
@@ -182,6 +168,7 @@ fn build_report(
         dst.set_sendfile_bytes(p.sendfile_bytes);
     }
 
+    let environments = &report.environments;
     let mut list = out
         .reborrow()
         .init_environments(environments.len() as u32);
@@ -207,6 +194,7 @@ fn build_report(
         }
     }
 
+    let docker_containers = &report.docker_containers;
     let mut list = out
         .reborrow()
         .init_docker_containers(docker_containers.len() as u32);
@@ -262,4 +250,124 @@ fn build_machine_stats(m: &MachineStats, mut out: linux_capnp::machine_stats::Bu
 fn process_name(name: &[u8; 64]) -> &str {
     let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
     std::str::from_utf8(&name[..end]).unwrap_or("<invalid>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, ProcessStats};
+
+    fn process(global_pid: u32, name: &str) -> ProcessStats {
+        let mut padded = [0u8; 64];
+        padded[..name.len()].copy_from_slice(name.as_bytes());
+        ProcessStats {
+            global_pid,
+            local_pid: 1,
+            mnt_ns: 10,
+            pid_ns: 20,
+            name: padded,
+            cpu_percent: 12.5,
+            rss_kb: 2048,
+            last_active_ns: 3,
+            vsock_rx_bytes: 4,
+            vsock_tx_bytes: 5,
+            p9_rx_bytes: 6,
+            p9_tx_bytes: 7,
+            tcp_tx_lo_bytes: 8,
+            tcp_rx_lo_bytes: 9,
+            tcp_tx_remote_bytes: 10,
+            tcp_rx_remote_bytes: 11,
+            udp_tx_lo_bytes: 12,
+            udp_rx_lo_bytes: 13,
+            udp_tx_remote_bytes: 14,
+            udp_rx_remote_bytes: 15,
+            uds_tx_bytes: 16,
+            uds_rx_bytes: 17,
+            disk_read_bytes: 18,
+            disk_write_bytes: 19,
+            disk_read_iops: 20,
+            disk_write_iops: 21,
+            pipe_read_bytes: 22,
+            pipe_write_bytes: 23,
+            sendfile_bytes: 24,
+        }
+    }
+
+    fn round_trip(report: &Report) -> capnp::message::Builder<capnp::message::HeapAllocator> {
+        let mut message = capnp::message::Builder::new_default();
+        build_report(report, message.init_root());
+        message
+    }
+
+    #[test]
+    fn a_report_reads_back_as_it_was_built() {
+        let mut report = Report::default();
+        report.machine.total_kb = 16_000_000;
+        report.machine.busy_ns = 42;
+        report.machine.cpu_count = 16;
+        report.processes.push(process(4242, "bash"));
+        report.environments.push(LinuxEnvironmentInfo {
+            mnt_ns: 10,
+            pid_ns: 20,
+            kind: LinuxEnvironmentKind::CurrentDistro {
+                name: "Ubuntu 24.04.3 LTS".into(),
+            },
+        });
+        report.environments.push(LinuxEnvironmentInfo {
+            mnt_ns: 30,
+            pid_ns: 40,
+            kind: LinuxEnvironmentKind::UnknownExternalNamespace,
+        });
+        report.docker_containers.push(LinuxDockerContainerInfo {
+            id: "abc123".into(),
+            mnt_ns: 50,
+            pid_ns: 60,
+            api_version: "v1.43".into(),
+            raw_json: "{}".into(),
+        });
+
+        let message = round_trip(&report);
+        let read = message
+            .get_root_as_reader::<linux_capnp::report::Reader>()
+            .unwrap();
+
+        let machine = read.get_machine().unwrap();
+        assert_eq!(machine.get_total_kb(), 16_000_000);
+        assert_eq!(machine.get_busy_ns(), 42);
+        assert_eq!(machine.get_cpu_count(), 16);
+
+        let processes = read.get_processes().unwrap();
+        assert_eq!(processes.len(), 1);
+        let p = processes.get(0);
+        assert_eq!(p.get_global_pid(), 4242);
+        assert_eq!(p.get_name().unwrap().to_str().unwrap(), "bash");
+        assert_eq!(p.get_cpu_percent(), 12.5);
+        assert_eq!(p.get_rss_kb(), 2048);
+        assert_eq!(p.get_uds_rx_bytes(), 17);
+        assert_eq!(p.get_sendfile_bytes(), 24);
+
+        let environments = read.get_environments().unwrap();
+        assert_eq!(environments.len(), 2);
+        let distro = environments.get(0);
+        assert_eq!(distro.get_kind().unwrap(), EnvironmentKind::CurrentDistro);
+        assert_eq!(
+            distro.get_name().unwrap().to_str().unwrap(),
+            "Ubuntu 24.04.3 LTS"
+        );
+        assert_eq!(
+            environments.get(1).get_kind().unwrap(),
+            EnvironmentKind::UnknownExternalNamespace
+        );
+
+        let containers = read.get_docker_containers().unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers.get(0).get_id().unwrap().to_str().unwrap(), "abc123");
+        assert_eq!(containers.get(0).get_pid_ns(), 60);
+    }
+
+    #[test]
+    fn a_name_without_a_nul_is_taken_whole() {
+        let name = [b'a'; 64];
+        assert_eq!(process_name(&name).len(), 64);
+    }
 }

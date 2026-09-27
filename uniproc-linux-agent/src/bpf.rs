@@ -9,7 +9,7 @@ use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd};
-use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, MachineStats, ProcessStats};
+use crate::report::{MachineStats, Report};
 
 mod prog {
     include!(concat!(env!("OUT_DIR"), "/prog.skel.rs"));
@@ -52,14 +52,7 @@ impl<'a> BpfAgent<'a> {
         })
     }
 
-    pub fn collect(
-        &mut self,
-    ) -> anyhow::Result<(
-        Vec<ProcessStats>,
-        Vec<LinuxEnvironmentInfo>,
-        Vec<LinuxDockerContainerInfo>,
-        MachineStats,
-    )> {
+    pub fn collect(&mut self) -> anyhow::Result<Report> {
         let map = &mut self.skel.maps.process_stats_map;
         let _ = self.gc.maybe_gc(map);
         let _ = self.cache.refresh(self.gc.live_pids());
@@ -86,7 +79,12 @@ impl<'a> BpfAgent<'a> {
         let batch = self.batch.lookup(&self.skel.maps.process_stats_map)?;
         let processes = self.metrics.normalize(batch.iter().copied(), &self.cache);
         let (environments, docker_containers) = self.environments.resolve(&processes);
-        Ok((processes, environments, docker_containers, machine))
+        Ok(Report {
+            machine,
+            processes,
+            environments,
+            docker_containers,
+        })
     }
 
     pub fn name_cache(&self) -> &NameCache {

@@ -3,7 +3,15 @@
 //! (rpc.rs) maps these onto capnp builders. Kept local (like the windows
 //! agent's SystemState) so collection code never touches capnp types.
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Report {
+    pub machine: MachineStats,
+    pub processes: Vec<ProcessStats>,
+    pub environments: Vec<LinuxEnvironmentInfo>,
+    pub docker_containers: Vec<LinuxDockerContainerInfo>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MachineStats {
     pub total_kb: u64,
     pub free_kb: u64,
@@ -41,7 +49,7 @@ pub struct MachineStats {
     pub cpu_count: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcessStats {
     pub global_pid: u32,
     pub local_pid: u32,
@@ -80,7 +88,7 @@ pub struct ProcessStats {
     pub sendfile_bytes: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LinuxEnvironmentKind {
     Unknown,
     CurrentDistro { name: String },
@@ -88,14 +96,14 @@ pub enum LinuxEnvironmentKind {
     UnknownExternalNamespace,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinuxEnvironmentInfo {
     pub mnt_ns: u64,
     pub pid_ns: u64,
     pub kind: LinuxEnvironmentKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinuxDockerContainerInfo {
     pub id: String,
     pub mnt_ns: u64,

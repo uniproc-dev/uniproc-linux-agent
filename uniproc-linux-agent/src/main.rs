@@ -1,12 +1,9 @@
-use crate::bpf::BpfAgent;
-use libbpf_rs::OpenObject;
-use std::mem::MaybeUninit;
-use std::sync::{Arc, Mutex};
 use tracing_subscriber::filter::LevelFilter;
 
 mod batch_lookup;
 mod bpf;
 mod environment_resolver;
+mod feed;
 mod iter_gc;
 mod name_cache;
 mod process_metrics_state;
@@ -27,12 +24,8 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(LevelFilter::DEBUG)
         .init();
 
-    // libbpf's skeleton borrows the OpenObject storage for as long as the skel
-    // itself lives. Leaking it is what makes the agent `'static`, which is what
-    // lets the RPC layer hand the same `Arc` to every session it accepts.
-    let open_object = Box::leak(Box::new(MaybeUninit::<OpenObject>::uninit()));
-    let agent = Arc::new(Mutex::new(BpfAgent::init(open_object)?));
-    rpc::run(agent, read_shared_secret()?).await
+    let (_monitor, latest) = feed::start()?;
+    rpc::run(latest, read_shared_secret()?).await
 }
 
 /// The host writes a one-shot secret to our stdin and closes it, then uses the
