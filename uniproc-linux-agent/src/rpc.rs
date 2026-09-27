@@ -10,14 +10,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use anyhow::Result;
-use ogurpchik::auth::handshake::{HandshakeMode, SchemaId};
+use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::accept_session;
 use uniproc_protocol::linux_capnp::{self, EnvironmentKind, linux_agent};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
-use uniproc_protocol::{LINUX_SCHEMA_ID, WSL_AGENT_VSOCK_PORT};
+use uniproc_protocol::{LINUX_PROTOCOL, WSL_AGENT_VSOCK_PORT};
 
 use uniproc_agent_kit::Latest;
 
@@ -101,7 +101,12 @@ async fn serve_loop(
         let session = match accept_session::<linux_agent::Client, _>(
             &listener,
             &handshake,
-            SchemaId(LINUX_SCHEMA_ID),
+            Protocol::new(
+                LINUX_PROTOCOL.id,
+                LINUX_PROTOCOL.major,
+                LINUX_PROTOCOL.minor,
+                LINUX_PROTOCOL.patch,
+            ),
             AgentImpl {
                 latest: latest.clone(),
             },
@@ -114,6 +119,7 @@ async fn serve_loop(
                 continue;
             }
         };
+        tracing::info!(peer_version = ?session.peer_version(), "host session accepted");
         live.set(live.get() + 1);
         let live = live.clone();
         compio::runtime::spawn(async move {
