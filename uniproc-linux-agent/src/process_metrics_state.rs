@@ -13,6 +13,7 @@ pub struct ProcessMetricsState {
     current_pids: FxHashSet<u32>,
     raw_buf: Vec<RawProcessStats>,
     num_cpus: usize,
+    last_window: Option<Instant>,
 }
 
 impl ProcessMetricsState {
@@ -22,6 +23,7 @@ impl ProcessMetricsState {
             current_pids: FxHashSet::default(),
             raw_buf: Vec::with_capacity(512),
             num_cpus,
+            last_window: None,
         }
     }
 
@@ -31,6 +33,7 @@ impl ProcessMetricsState {
         names: &NameCache,
     ) -> Vec<ProcessStats> {
         let now = Instant::now();
+        let window_start = self.last_window.replace(now);
 
         self.raw_buf.clear();
         self.raw_buf.extend(raw_data);
@@ -51,19 +54,16 @@ impl ProcessMetricsState {
                         time: now,
                     },
                 );
-                let cpu_percent = match prev {
-                    Some(prev) => {
-                        let elapsed_ns = now.duration_since(prev.time).as_nanos() as f64;
-                        if elapsed_ns > 0.0 {
-                            let delta_runtime =
-                                raw.cpu_runtime_ns.saturating_sub(prev.cpu_runtime_ns) as f64;
-                            let num_cpus = self.num_cpus.max(1) as f64;
-                            ((delta_runtime / elapsed_ns) * 100.0 / num_cpus).clamp(0.0, 100.0)
-                                as f32
-                        } else {
-                            0.0
-                        }
-                    }
+                let since = prev.or(window_start.map(|time| ProcHistory {
+                    cpu_runtime_ns: 0,
+                    time,
+                }));
+                let cpu_percent = match since {
+                    Some(prev) => cpu_percent(
+                        raw.cpu_runtime_ns.saturating_sub(prev.cpu_runtime_ns),
+                        now.duration_since(prev.time).as_nanos() as u64,
+                        self.num_cpus,
+                    ),
                     None => 0.0,
                 };
 
@@ -116,6 +116,7 @@ impl ProcessMetricsState {
             })
             .collect()
     }
+
     /// Aggregates one entry of a `BPF_MAP_TYPE_PERCPU_ARRAY`, as returned by
     /// `Map::lookup_percpu()`: one buffer per possible CPU.
     ///
@@ -222,6 +223,14 @@ impl ProcessMetricsState {
     }
 }
 
+fn cpu_percent(runtime_ns: u64, elapsed_ns: u64, num_cpus: usize) -> f32 {
+    if elapsed_ns == 0 {
+        return 0.0;
+    }
+    let num_cpus = num_cpus.max(1) as f64;
+    ((runtime_ns as f64 / elapsed_ns as f64) * 100.0 / num_cpus).clamp(0.0, 100.0) as f32
+}
+
 pub const UNKNOWN_PROCESS_NAME: [u8; 64] = {
     let mut buf = [0u8; 64];
     let src = b"<unknown>";
@@ -276,6 +285,50 @@ pub struct RawMachineStats {
     pub pipe_write_bytes: u64,
 
     pub sendfile_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw(global_pid: u32, cpu_runtime_ns: u64) -> RawProcessStats {
+        RawProcessStats {
+            global_pid,
+            cpu_runtime_ns,
+            ..Default::default()
+        }
+    }
+
+    fn cpu_of(stats: &[ProcessStats], pid: u32) -> f32 {
+        stats.iter().find(|p| p.global_pid == pid).unwrap().cpu_percent
+    }
+
+    #[test]
+    fn the_agents_first_window_has_no_cpu_to_report() {
+        let mut state = ProcessMetricsState::new(1);
+        let names = NameCache::new(-1);
+        let first = state.normalize([raw(1, 5_000_000_000)].into_iter(), &names);
+        assert_eq!(cpu_of(&first, 1), 0.0);
+    }
+
+    #[test]
+    fn a_process_first_seen_later_is_measured_over_the_last_window() {
+        let mut state = ProcessMetricsState::new(1);
+        let names = NameCache::new(-1);
+        state.normalize([raw(1, 0)].into_iter(), &names);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = state.normalize([raw(1, 0), raw(2, 10_000_000)].into_iter(), &names);
+        let cpu = cpu_of(&second, 2);
+        assert!(cpu > 0.0 && cpu <= 50.0, "{cpu}");
+        assert_eq!(cpu_of(&second, 1), 0.0);
+    }
+
+    #[test]
+    fn cpu_is_spread_over_every_cpu_and_capped() {
+        assert_eq!(cpu_percent(1_000, 1_000, 4), 25.0);
+        assert_eq!(cpu_percent(10_000, 1_000, 1), 100.0);
+        assert_eq!(cpu_percent(1, 0, 1), 0.0);
+    }
 }
 
 #[repr(C)]

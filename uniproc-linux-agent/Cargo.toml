@@ -16,7 +16,7 @@ ogurpchik = { git = "https://github.com/uniproc-dev/oguRPChik", tag = "v0.6.3" }
 libbpf-rs = "0.26.0"
 serde_json = "1.0.149"
 uniproc-protocol = { git = "https://github.com/uniproc-dev/uniproc-protocol", tag = "v0.9.0" }
-uniproc-agent-kit = { git = "https://github.com/uniproc-dev/uniproc-agent-kit", tag = "v0.1.0" }
+uniproc-agent-kit = { git = "https://github.com/uniproc-dev/uniproc-agent-kit", tag = "v0.1.1" }
 capnp = "0.27"
 tracing = "0.1"
 tracing-subscriber = "0.3.22"

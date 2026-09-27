@@ -19,12 +19,13 @@ use uniproc_protocol::linux_capnp::{self, EnvironmentKind, linux_agent};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
 use uniproc_protocol::{LINUX_SCHEMA_ID, WSL_AGENT_VSOCK_PORT};
 
-use crate::feed::Latest;
+use uniproc_agent_kit::Latest;
+
 use crate::report::{LinuxEnvironmentKind, MachineStats, Report};
 
 #[derive(Clone)]
 struct AgentImpl {
-    latest: Latest,
+    latest: Latest<Report>,
 }
 
 impl linux_agent::Server for AgentImpl {
@@ -65,7 +66,7 @@ fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_status(ResponseStatus::Ok);
 }
 
-pub async fn run(latest: Latest, secret: Vec<u8>) -> Result<()> {
+pub async fn run(latest: Latest<Report>, secret: Vec<u8>) -> Result<()> {
     // vsock carries no peer identity across the VM boundary - `getpeername`
     // yields a CID, and a PID from another kernel would be meaningless - so
     // `HandshakeMode::signed_process` cannot work here at all; it refuses this
@@ -90,7 +91,11 @@ pub async fn run(latest: Latest, secret: Vec<u8>) -> Result<()> {
     serve_loop(vsock_listener, latest, handshake).await
 }
 
-async fn serve_loop(listener: Listener, latest: Latest, handshake: HandshakeMode) -> Result<()> {
+async fn serve_loop(
+    listener: Listener,
+    latest: Latest<Report>,
+    handshake: HandshakeMode,
+) -> Result<()> {
     let live = Rc::new(Cell::new(0usize));
     loop {
         let session = match accept_session::<linux_agent::Client, _>(
