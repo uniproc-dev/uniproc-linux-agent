@@ -24,8 +24,8 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(LevelFilter::DEBUG)
         .init();
 
-    let (_monitor, latest) = feed::start()?;
-    rpc::run(latest, read_shared_secret()?).await
+    let (_monitor, feed) = feed::start()?;
+    rpc::run(feed, read_shared_secret()?).await
 }
 
 /// The host writes a one-shot secret to our stdin and closes it, then uses the

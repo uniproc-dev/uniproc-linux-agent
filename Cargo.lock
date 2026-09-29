@@ -1640,8 +1640,8 @@ checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
 name = "uniproc-agent-kit"
-version = "0.1.1"
-source = "git+https://github.com/uniproc-dev/uniproc-agent-kit?tag=v0.1.1#d47b8d1432b72a22b7f3c7c26f9cde80c7d15633"
+version = "0.3.0"
+source = "git+https://github.com/uniproc-dev/uniproc-agent-kit?tag=v0.3.0#44ab14e65971092b3f998e6621a66fbcff659a9a"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1652,10 +1652,11 @@ dependencies = [
 
 [[package]]
 name = "uniproc-linux-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "capnp",
+ "capnp-rpc",
  "compio",
  "env_logger",
  "futures",
@@ -1681,8 +1682,8 @@ dependencies = [
 
 [[package]]
 name = "uniproc-protocol"
-version = "0.11.0"
-source = "git+https://github.com/uniproc-dev/uniproc-protocol?tag=v0.11.0#c81dbf402757c1be2c4b903357ab02cc9ccd4adb"
+version = "0.12.7"
+source = "git+https://github.com/uniproc-dev/uniproc-protocol?tag=v0.12.7#e2d5e34f870dfb0ace024c60b9f0a4ee0582a1bf"
 dependencies = [
  "capnp",
  "capnp-rpc",

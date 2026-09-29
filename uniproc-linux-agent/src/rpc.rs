@@ -8,24 +8,31 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::future::{AbortHandle, Abortable};
 use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::accept_session;
-use uniproc_protocol::linux_capnp::{self, EnvironmentKind, linux_agent};
+use uniproc_protocol::linux_capnp::{
+    self, EnvironmentKind, linux_agent, report_listener, watch_handle,
+};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
 use uniproc_protocol::{LINUX_PROTOCOL, WSL_AGENT_VSOCK_PORT};
 
-use uniproc_agent_kit::Latest;
-
+use crate::feed::Feed;
 use crate::report::{LinuxEnvironmentKind, MachineStats, Report};
+
+const MIN_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct AgentImpl {
-    latest: Latest<Report>,
+    feed: Feed,
 }
 
 impl linux_agent::Server for AgentImpl {
@@ -45,6 +52,7 @@ impl linux_agent::Server for AgentImpl {
     ) -> std::result::Result<(), capnp::Error> {
         let if_none_match = params.get()?.get_meta()?.get_if_none_match();
         let current = self
+            .feed
             .latest
             .get()
             .map_err(|e| capnp::Error::failed(format!("collect failed: {e}")))?;
@@ -59,6 +67,68 @@ impl linux_agent::Server for AgentImpl {
         build_report(&current.value, out.init_report());
         Ok(())
     }
+
+    async fn watch(
+        self: Rc<Self>,
+        params: linux_agent::WatchParams,
+        mut results: linux_agent::WatchResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let params = params.get()?;
+        let interval = watch_interval(params.get_interval_ms());
+        let listener = params.get_listener()?;
+        let (abort, registration) = AbortHandle::new_pair();
+        compio::runtime::spawn(Abortable::new(
+            push(self.feed.clone(), interval, listener),
+            registration,
+        ))
+        .detach();
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_handle(capnp_rpc::new_client(WatchHandleImpl(abort)));
+        Ok(())
+    }
+}
+
+struct WatchHandleImpl(AbortHandle);
+
+impl watch_handle::Server for WatchHandleImpl {}
+
+impl Drop for WatchHandleImpl {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn watch_interval(interval_ms: u32) -> Duration {
+    if interval_ms == 0 {
+        return DEFAULT_INTERVAL;
+    }
+    Duration::from_millis(interval_ms.into()).clamp(MIN_INTERVAL, MAX_INTERVAL)
+}
+
+async fn push(feed: Feed, interval: Duration, listener: report_listener::Client) {
+    let _lease = feed.lease(interval);
+    let mut generation = feed.fresh.generation();
+    let mut sent = 0;
+    loop {
+        if let Ok(current) = feed.latest.get()
+            && current.etag != sent
+        {
+            let started = Instant::now();
+            let mut request = listener.update_request();
+            let mut out = request.get();
+            out.reborrow().init_meta();
+            out.set_etag(current.etag);
+            build_report(&current.value, out.init_report());
+            if let Err(e) = request.send().promise.await {
+                tracing::info!("watch ended by its listener: {e}");
+                return;
+            }
+            sent = current.etag;
+            compio::time::sleep(interval.saturating_sub(started.elapsed())).await;
+        }
+        generation = feed.fresh.changed(generation).await;
+    }
 }
 
 fn uncacheable(mut meta: response_meta::Builder) {
@@ -66,7 +136,7 @@ fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_status(ResponseStatus::Ok);
 }
 
-pub async fn run(latest: Latest<Report>, secret: Vec<u8>) -> Result<()> {
+pub async fn run(feed: Feed, secret: Vec<u8>) -> Result<()> {
     // vsock carries no peer identity across the VM boundary - `getpeername`
     // yields a CID, and a PID from another kernel would be meaningless - so
     // `HandshakeMode::signed_process` cannot work here at all; it refuses this
@@ -88,14 +158,10 @@ pub async fn run(latest: Latest<Report>, secret: Vec<u8>) -> Result<()> {
 
     tracing::info!(%vsock, "listening");
 
-    serve_loop(vsock_listener, latest, handshake).await
+    serve_loop(vsock_listener, feed, handshake).await
 }
 
-async fn serve_loop(
-    listener: Listener,
-    latest: Latest<Report>,
-    handshake: HandshakeMode,
-) -> Result<()> {
+async fn serve_loop(listener: Listener, feed: Feed, handshake: HandshakeMode) -> Result<()> {
     let live = Rc::new(Cell::new(0usize));
     loop {
         let session = match accept_session::<linux_agent::Client, _>(
@@ -107,9 +173,7 @@ async fn serve_loop(
                 LINUX_PROTOCOL.minor,
                 LINUX_PROTOCOL.patch,
             ),
-            AgentImpl {
-                latest: latest.clone(),
-            },
+            AgentImpl { feed: feed.clone() },
         )
         .await
         {
@@ -374,6 +438,79 @@ mod tests {
         assert_eq!(containers.len(), 1);
         assert_eq!(containers.get(0).get_id().unwrap().to_str().unwrap(), "abc123");
         assert_eq!(containers.get(0).get_pid_ns(), 60);
+    }
+
+    struct Recorder(Rc<std::cell::RefCell<Vec<(u64, u64)>>>);
+
+    impl report_listener::Server for Recorder {
+        async fn update(
+            self: Rc<Self>,
+            params: report_listener::UpdateParams,
+            _: report_listener::UpdateResults,
+        ) -> std::result::Result<(), capnp::Error> {
+            let params = params.get()?;
+            let total_kb = params.get_report()?.get_machine()?.get_total_kb();
+            self.0.borrow_mut().push((params.get_etag(), total_kb));
+            Ok(())
+        }
+    }
+
+    fn publish(feed: &Feed, total_kb: u64) {
+        let mut report = Report::default();
+        report.machine.total_kb = total_kb;
+        feed.latest.set(report);
+        feed.fresh.notify();
+    }
+
+    async fn until(what: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !what() {
+            assert!(Instant::now() < deadline, "timed out");
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[compio::test]
+    async fn a_watch_pushes_each_new_report_until_its_handle_is_released() {
+        let feed = Feed::without_collector();
+        publish(&feed, 1);
+        let agent: linux_agent::Client = capnp_rpc::new_client(AgentImpl { feed: feed.clone() });
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let listener: report_listener::Client = capnp_rpc::new_client(Recorder(seen.clone()));
+
+        let mut request = agent.watch_request();
+        request.get().init_meta();
+        request.get().set_interval_ms(100);
+        request.get().set_listener(listener);
+        let response = request.send().promise.await.unwrap();
+        let handle = response.get().unwrap().get_handle().unwrap();
+
+        until(|| seen.borrow().len() == 1).await;
+        assert_eq!(seen.borrow()[0], (feed.latest.get().unwrap().etag, 1));
+        assert_eq!(feed.period(), Duration::from_millis(100));
+
+        publish(&feed, 2);
+        until(|| seen.borrow().len() == 2).await;
+        assert_eq!(seen.borrow()[1].1, 2);
+
+        feed.fresh.notify();
+        compio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(seen.borrow().len(), 2);
+
+        drop(handle);
+        drop(response);
+        until(|| feed.period() == Duration::from_secs(1)).await;
+        publish(&feed, 3);
+        compio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(seen.borrow().len(), 2);
+    }
+
+    #[test]
+    fn an_interval_is_clamped_and_zero_means_a_second() {
+        assert_eq!(watch_interval(0), Duration::from_secs(1));
+        assert_eq!(watch_interval(1), Duration::from_millis(100));
+        assert_eq!(watch_interval(500), Duration::from_millis(500));
+        assert_eq!(watch_interval(u32::MAX), Duration::from_secs(60));
     }
 
     #[test]
