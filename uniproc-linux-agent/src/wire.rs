@@ -7,6 +7,7 @@ use crate::model::{
     Transports,
 };
 use crate::report::LinuxEnvironmentKind;
+use crate::units::{Unit, UnitStatus};
 
 /// Which columns and machine groups one watch asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,6 +85,37 @@ pub fn process_state(s: &State, mut out: linux_capnp::process_state::Builder) {
 pub fn process_key(key: Key, mut out: linux_capnp::process_key::Builder) {
     out.set_pid(key.pid);
     out.set_sequence_number(key.sequence_number);
+}
+
+pub fn units(units: &[Unit], mut list: capnp::struct_list::Builder<linux_capnp::unit_info::Owned>) {
+    for (i, u) in units.iter().enumerate() {
+        let mut out = list.reborrow().get(i as u32);
+        out.set_name(u.name.as_str());
+        out.set_description(u.description.as_str());
+        out.set_load_state(u.load);
+        out.set_active_state(u.active);
+        out.set_sub_state(u.sub.as_str());
+        out.set_unit_file_state(u.file_state);
+        out.set_unit_file(u.file.as_str());
+        let main = u.main.unwrap_or_default();
+        out.set_main_pid(main.pid);
+        out.set_main_sequence_number(main.sequence_number);
+        out.set_job(u.job);
+    }
+}
+
+pub fn unit_status(s: &UnitStatus, mut out: linux_capnp::unit_status::Builder) {
+    out.set_load_state(s.load);
+    out.set_active_state(s.active);
+    out.set_sub_state(s.sub.as_str());
+    let main = s.main.unwrap_or_default();
+    out.set_main_pid(main.pid);
+    out.set_main_sequence_number(main.sequence_number);
+    out.set_job(s.job);
+    out.set_result(s.result.as_str());
+    out.set_exec_main_code(s.exec_main_code);
+    out.set_exec_main_status(s.exec_main_status);
+    out.set_restarts(s.restarts);
 }
 
 pub fn environments(

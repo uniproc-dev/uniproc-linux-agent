@@ -32,6 +32,11 @@ impl Feed {
             interval,
         }
     }
+
+    /// Asks the collector for a snapshot now, within its spacing.
+    pub fn wake(&self) {
+        self.schedule.waker.wake();
+    }
 }
 
 #[derive(Clone)]

@@ -1,6 +1,6 @@
 [package]
 name = "uniproc-linux-agent"
-version = "1.0.0"
+version = "1.1.0"
 edition.workspace = true
 
 license.workspace = true
@@ -15,13 +15,14 @@ compio = "0.18.0"
 ogurpchik = { git = "https://github.com/uniproc-dev/oguRPChik", tag = "v0.7.0" }
 libbpf-rs = "0.26.0"
 serde_json = "1.0.149"
-uniproc-protocol = { git = "https://github.com/uniproc-dev/uniproc-protocol", tag = "v0.13.1" }
+uniproc-protocol = { git = "https://github.com/uniproc-dev/uniproc-protocol", tag = "v0.14.0" }
 uniproc-agent-kit = { git = "https://github.com/uniproc-dev/uniproc-agent-kit", tag = "v0.3.0" }
 capnp = "0.27"
 capnp-rpc = "0.27"
 tracing = "0.1"
 tracing-subscriber = "0.3.22"
 futures = "0.3.32"
+zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
 
 [build-dependencies]
 libbpf-cargo = "0.26.0"

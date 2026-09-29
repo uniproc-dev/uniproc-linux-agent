@@ -13,20 +13,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use futures::StreamExt;
 use futures::future::{AbortHandle, Abortable};
 use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::accept_session;
-use uniproc_agent_kit::Tagged;
-use uniproc_protocol::linux_capnp::{agent_listener, linux_agent, lists_update, watch_handle};
+use uniproc_agent_kit::{Busy, Tagged, Watch};
+use uniproc_protocol::linux_capnp::{agent_listener, linux_agent, lists_update, unit_watcher, watch_handle};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
 use uniproc_protocol::{LINUX_PROTOCOL, WSL_AGENT_VSOCK_PORT};
 
 use crate::commands;
 use crate::feed::Feed;
 use crate::model::{Key, Passports, Snapshot, States};
+use crate::units::{Unit, UnitStatus, Units};
 use crate::wire::{self, Wanted};
 
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
@@ -36,9 +38,18 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 struct AgentImpl {
     feed: Feed,
+    units: Units,
 }
 
 impl AgentImpl {
+    async fn unit_job(&self, name: capnp::text::Reader<'_>, method: &'static str) -> std::result::Result<u32, capnp::Error> {
+        let name = name.to_str()?.to_owned();
+        Ok(match self.units.command(name, method) {
+            Ok(answer) => answer.await.unwrap_or(libc::EIO as u32),
+            Err(Busy) => libc::EBUSY as u32,
+        })
+    }
+
     fn snapshot(&self) -> std::result::Result<Arc<Snapshot>, capnp::Error> {
         self.feed
             .latest
@@ -161,7 +172,7 @@ impl linux_agent::Server for AgentImpl {
         let listener = params.get_listener()?;
         let (abort, registration) = AbortHandle::new_pair();
         compio::runtime::spawn(Abortable::new(
-            push(self.feed.clone(), interval, wanted, listener),
+            push(self.feed.clone(), self.units.clone(), interval, wanted, listener),
             registration,
         ))
         .detach();
@@ -271,6 +282,100 @@ impl linux_agent::Server for AgentImpl {
         out.set_code(code);
         Ok(())
     }
+
+    async fn get_units(
+        self: Rc<Self>,
+        params: linux_agent::GetUnitsParams,
+        mut results: linux_agent::GetUnitsResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let if_none_match = params.get()?.get_meta()?.get_if_none_match();
+        let units = self.units.list();
+        let mut out = results.get();
+        if !answer(&units, if_none_match, out.reborrow().init_meta()) {
+            return Ok(());
+        }
+        wire::units(&units.value, out.init_units(units.value.len() as u32));
+        Ok(())
+    }
+
+    async fn unit_start(
+        self: Rc<Self>,
+        params: linux_agent::UnitStartParams,
+        mut results: linux_agent::UnitStartResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let code = self.unit_job(params.get()?.get_name()?, "StartUnit").await?;
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn unit_stop(
+        self: Rc<Self>,
+        params: linux_agent::UnitStopParams,
+        mut results: linux_agent::UnitStopResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let code = self.unit_job(params.get()?.get_name()?, "StopUnit").await?;
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn unit_restart(
+        self: Rc<Self>,
+        params: linux_agent::UnitRestartParams,
+        mut results: linux_agent::UnitRestartResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let code = self.unit_job(params.get()?.get_name()?, "RestartUnit").await?;
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn unit_reload(
+        self: Rc<Self>,
+        params: linux_agent::UnitReloadParams,
+        mut results: linux_agent::UnitReloadResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let code = self.unit_job(params.get()?.get_name()?, "ReloadUnit").await?;
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn watch_unit(
+        self: Rc<Self>,
+        params: linux_agent::WatchUnitParams,
+        mut results: linux_agent::WatchUnitResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let params = params.get()?;
+        let name = params.get_name()?.to_str()?.to_owned();
+        let watcher = params.get_watcher()?;
+        let (abort, registration) = AbortHandle::new_pair();
+        compio::runtime::spawn(Abortable::new(follow_unit(self.units.watch(name), watcher), registration)).detach();
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_handle(capnp_rpc::new_client(WatchHandleImpl(abort)));
+        Ok(())
+    }
+}
+
+async fn follow_unit(mut statuses: Watch<UnitStatus>, watcher: unit_watcher::Client) {
+    while let Some(status) = statuses.next().await {
+        let mut request = watcher.changed_request();
+        request.get().init_meta();
+        wire::unit_status(&status, request.get().init_status());
+        if let Err(e) = request.send().promise.await {
+            tracing::info!("unit watch ended by its watcher: {e}");
+            return;
+        }
+    }
+    let mut request = watcher.ended_request();
+    request.get().init_meta();
+    let _ = request.send().promise.await;
 }
 
 struct WatchHandleImpl(AbortHandle);
@@ -296,20 +401,22 @@ struct Sent {
     passports: Tagged<Arc<Passports>>,
     states: Tagged<Arc<States>>,
     environments_etag: u64,
+    units_etag: u64,
 }
 
 impl Sent {
-    fn of(snapshot: &Snapshot) -> Self {
+    fn of(snapshot: &Snapshot, units: &Tagged<Arc<Vec<Unit>>>) -> Self {
         Self {
             number: snapshot.number,
             passports: snapshot.passports.clone(),
             states: snapshot.states.clone(),
             environments_etag: snapshot.environments.etag,
+            units_etag: units.etag,
         }
     }
 }
 
-async fn push(feed: Feed, interval: Duration, wanted: Wanted, listener: agent_listener::Client) {
+async fn push(feed: Feed, units: Units, interval: Duration, wanted: Wanted, listener: agent_listener::Client) {
     let _lease = feed.lease(interval);
     let mut generation = feed.fresh.generation();
     let mut sent: Option<Sent> = None;
@@ -318,18 +425,19 @@ async fn push(feed: Feed, interval: Duration, wanted: Wanted, listener: agent_li
             && sent.as_ref().is_none_or(|s| s.number != current.value.number)
         {
             let snapshot = &current.value;
+            let units = units.list();
             let started = Instant::now();
             let mut request = listener.update_request();
             let mut out = request.get();
             out.reborrow().init_meta();
-            lists(sent.as_ref(), snapshot, out.reborrow().init_lists());
+            lists(sent.as_ref(), snapshot, &units, out.reborrow().init_lists());
             wire::columns(snapshot, wanted, out.reborrow().init_processes());
             wire::machine(snapshot, wanted, out.init_machine());
             if let Err(e) = request.send().promise.await {
                 tracing::info!("watch ended by its listener: {e}");
                 return;
             }
-            sent = Some(Sent::of(snapshot));
+            sent = Some(Sent::of(snapshot, &units));
             compio::time::sleep(interval.saturating_sub(started.elapsed())).await;
         }
         generation = feed.fresh.changed(generation).await;
@@ -350,10 +458,11 @@ fn changes<'a, V: PartialEq>(
     (left, upserted)
 }
 
-fn lists(sent: Option<&Sent>, snapshot: &Snapshot, mut out: lists_update::Builder) {
+fn lists(sent: Option<&Sent>, snapshot: &Snapshot, units: &Tagged<Arc<Vec<Unit>>>, mut out: lists_update::Builder) {
     out.set_passport_etag(snapshot.passports.etag);
     out.set_states_etag(snapshot.states.etag);
     out.set_environments_etag(snapshot.environments.etag);
+    out.set_units_etag(units.etag);
 
     let passports = &snapshot.passports.value;
     match sent.map(|s| &s.passports) {
@@ -409,14 +518,19 @@ fn lists(sent: Option<&Sent>, snapshot: &Snapshot, mut out: lists_update::Builde
 
     match sent {
         Some(s) if s.environments_etag == snapshot.environments.etag => {
-            out.init_environments().set_unchanged(())
+            out.reborrow().init_environments().set_unchanged(())
         }
         _ => {
             let e = &snapshot.environments.value;
-            let mut full = out.init_environments().init_full();
+            let mut full = out.reborrow().init_environments().init_full();
             wire::environments(e, full.reborrow().init_environments(e.environments.len() as u32));
             wire::docker_containers(e, full.init_docker_containers(e.docker_containers.len() as u32));
         }
+    }
+
+    match sent {
+        Some(s) if s.units_etag == units.etag => out.init_units().set_unchanged(()),
+        _ => wire::units(&units.value, out.init_units().init_full(units.value.len() as u32)),
     }
 }
 
@@ -430,7 +544,9 @@ mod tests {
     use std::cell::RefCell;
 
     use uniproc_agent_kit::{Epoch, Versioned};
-    use uniproc_protocol::linux_capnp::{MachineMetric, ProcessMetric, lists_update};
+    use uniproc_protocol::linux_capnp::{
+        MachineMetric, ProcessMetric, UnitActiveState, UnitFileState, UnitJob, UnitLoadState, lists_update,
+    };
 
     use super::*;
     use crate::model::{Environments, Machine, MachineMemory, Passport, Row, SchedPolicy, State, TaskState};
@@ -536,6 +652,7 @@ mod tests {
         resident_set_present: bool,
         memory_total: Option<u64>,
         cpu_present: bool,
+        units: String,
     }
 
     fn keys(list: capnp::struct_list::Reader<uniproc_protocol::linux_capnp::process_key::Owned>) -> String {
@@ -575,6 +692,13 @@ mod tests {
                     format!("delta:-{}+{}", keys(delta.get_left()?), delta.get_upserted()?.len())
                 }
             };
+            let units = match lists.get_units().which()? {
+                lists_update::units::Unchanged(()) => "unchanged".to_string(),
+                lists_update::units::Full(full) => format!(
+                    "full:{}",
+                    full?.iter().map(|u| u.get_name().unwrap().to_string().unwrap()).collect::<Vec<_>>().join(",")
+                ),
+            };
             let columns = p.get_processes()?;
             let machine = p.get_machine()?;
             self.0.borrow_mut().push(Update {
@@ -586,6 +710,7 @@ mod tests {
                 resident_set_present: columns.has_resident_set(),
                 memory_total: machine.has_memory().then(|| machine.get_memory().unwrap().get_total()),
                 cpu_present: machine.has_cpu(),
+                units,
             });
             Ok(())
         }
@@ -608,7 +733,161 @@ mod tests {
     }
 
     fn agent(feed: &Feed) -> linux_agent::Client {
-        capnp_rpc::new_client(AgentImpl { feed: feed.clone() })
+        agent_with(feed, &Units::detached().0)
+    }
+
+    fn agent_with(feed: &Feed, units: &Units) -> linux_agent::Client {
+        capnp_rpc::new_client(AgentImpl {
+            feed: feed.clone(),
+            units: units.clone(),
+        })
+    }
+
+    fn unit(name: &str, active: UnitActiveState) -> Unit {
+        Unit {
+            name: name.into(),
+            description: String::new(),
+            load: UnitLoadState::Loaded,
+            active,
+            sub: String::new(),
+            file_state: UnitFileState::Enabled,
+            file: String::new(),
+            main: (active == UnitActiveState::Active).then(|| key(10)),
+            job: UnitJob::None,
+        }
+    }
+
+    #[compio::test]
+    async fn get_units_is_conditional_and_names_main_processes_globally() {
+        let (units, _board) = Units::detached();
+        units.latest.set(vec![unit("ssh.service", UnitActiveState::Active)]);
+        let agent = agent_with(&Feed::without_collector(), &units);
+
+        let response = agent.get_units_request().send().promise.await.unwrap();
+        let answer = response.get().unwrap();
+        let etag = answer.get_meta().unwrap().get_etag();
+        let ssh = answer.get_units().unwrap().get(0);
+        assert_eq!(ssh.get_name().unwrap().to_str().unwrap(), "ssh.service");
+        assert_eq!(ssh.get_active_state().unwrap(), UnitActiveState::Active);
+        assert_eq!((ssh.get_main_pid(), ssh.get_main_sequence_number()), (10, key(10).sequence_number));
+
+        units.latest.set(vec![unit("ssh.service", UnitActiveState::Active)]);
+        let mut request = agent.get_units_request();
+        request.get().init_meta().set_if_none_match(etag);
+        let response = request.send().promise.await.unwrap();
+        assert_eq!(response.get().unwrap().get_meta().unwrap().get_status().unwrap(), ResponseStatus::NotModified);
+
+        units.latest.set(vec![unit("ssh.service", UnitActiveState::Inactive)]);
+        let mut request = agent.get_units_request();
+        request.get().init_meta().set_if_none_match(etag);
+        let response = request.send().promise.await.unwrap();
+        let ssh = response.get().unwrap().get_units().unwrap().get(0);
+        assert_eq!(ssh.get_active_state().unwrap(), UnitActiveState::Inactive);
+        assert_eq!(ssh.get_main_pid(), 0);
+    }
+
+    #[compio::test]
+    async fn a_unit_command_without_systemd_is_not_connected() {
+        let agent = agent(&Feed::without_collector());
+        let mut request = agent.unit_restart_request();
+        request.get().set_name("ssh.service");
+        let code = request.send().promise.await.unwrap().get().unwrap().get_code();
+        assert_eq!(code, libc::ENOTCONN as u32);
+    }
+
+    struct UnitRecorder {
+        seen: Rc<RefCell<Vec<(UnitActiveState, u32)>>>,
+        ended: Rc<Cell<bool>>,
+    }
+
+    impl unit_watcher::Server for UnitRecorder {
+        async fn changed(
+            self: Rc<Self>,
+            params: unit_watcher::ChangedParams,
+            _: unit_watcher::ChangedResults,
+        ) -> std::result::Result<(), capnp::Error> {
+            let status = params.get()?.get_status()?;
+            self.seen.borrow_mut().push((status.get_active_state()?, status.get_main_pid()));
+            Ok(())
+        }
+
+        async fn ended(
+            self: Rc<Self>,
+            _: unit_watcher::EndedParams,
+            _: unit_watcher::EndedResults,
+        ) -> std::result::Result<(), capnp::Error> {
+            self.ended.set(true);
+            Ok(())
+        }
+    }
+
+    fn status(active: UnitActiveState, main: Option<Key>) -> UnitStatus {
+        UnitStatus {
+            load: UnitLoadState::Loaded,
+            active,
+            sub: String::new(),
+            main,
+            job: UnitJob::None,
+            result: "success".into(),
+            exec_main_code: 0,
+            exec_main_status: 0,
+            restarts: 0,
+        }
+    }
+
+    #[compio::test]
+    async fn a_unit_watch_streams_every_status_then_ends_with_the_unit() {
+        let (units, mut board) = Units::detached();
+        let agent = agent_with(&Feed::without_collector(), &units);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let ended = Rc::new(Cell::new(false));
+
+        let mut request = agent.watch_unit_request();
+        request.get().set_name("ssh.service");
+        request.get().set_watcher(capnp_rpc::new_client(UnitRecorder {
+            seen: seen.clone(),
+            ended: ended.clone(),
+        }));
+        let _response = request.send().promise.await.unwrap();
+
+        let name = "ssh.service".to_string();
+        board.take_requests(|n| n == "ssh.service");
+        board.publish(&name, status(UnitActiveState::Activating, None));
+        board.publish(&name, status(UnitActiveState::Active, Some(key(10))));
+        until(|| seen.borrow().len() == 2).await;
+        assert_eq!(
+            *seen.borrow(),
+            [(UnitActiveState::Activating, 0), (UnitActiveState::Active, 10)]
+        );
+
+        board.end(&name);
+        until(|| ended.get()).await;
+    }
+
+    #[compio::test]
+    async fn a_watch_carries_the_units_once_and_then_says_unchanged() {
+        let feed = Feed::without_collector();
+        let (units, _board) = Units::detached();
+        units.latest.set(vec![unit("ssh.service", UnitActiveState::Active)]);
+        let mut lists = Lists::new();
+        lists.publish(&feed, &[(10, 0)]);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let mut request = agent_with(&feed, &units).watch_request();
+        request.get().init_spec().set_interval_ms(100);
+        request.get().set_listener(capnp_rpc::new_client(Recorder(seen.clone())));
+        let _response = request.send().promise.await.unwrap();
+        until(|| seen.borrow().len() == 1).await;
+        assert_eq!(seen.borrow()[0].units, "full:ssh.service");
+
+        lists.publish(&feed, &[(10, 0)]);
+        until(|| seen.borrow().len() == 2).await;
+        assert_eq!(seen.borrow()[1].units, "unchanged");
+
+        units.latest.set(vec![unit("ssh.service", UnitActiveState::Failed)]);
+        lists.publish(&feed, &[(10, 0)]);
+        until(|| seen.borrow().len() == 3).await;
+        assert_eq!(seen.borrow()[2].units, "full:ssh.service");
     }
 
     #[compio::test]
@@ -751,7 +1030,7 @@ mod tests {
     }
 }
 
-pub async fn run(feed: Feed, secret: Vec<u8>) -> Result<()> {
+pub async fn run(feed: Feed, units: Units, secret: Vec<u8>) -> Result<()> {
     // vsock carries no peer identity across the VM boundary - `getpeername`
     // yields a CID, and a PID from another kernel would be meaningless - so
     // `HandshakeMode::signed_process` cannot work here at all; it refuses this
@@ -773,10 +1052,10 @@ pub async fn run(feed: Feed, secret: Vec<u8>) -> Result<()> {
 
     tracing::info!(%vsock, "listening");
 
-    serve_loop(vsock_listener, feed, handshake).await
+    serve_loop(vsock_listener, AgentImpl { feed, units }, handshake).await
 }
 
-async fn serve_loop(listener: Listener, feed: Feed, handshake: HandshakeMode) -> Result<()> {
+async fn serve_loop(listener: Listener, agent: AgentImpl, handshake: HandshakeMode) -> Result<()> {
     let live = Rc::new(Cell::new(0usize));
     loop {
         let session = match accept_session::<linux_agent::Client, _>(
@@ -788,7 +1067,7 @@ async fn serve_loop(listener: Listener, feed: Feed, handshake: HandshakeMode) ->
                 LINUX_PROTOCOL.minor,
                 LINUX_PROTOCOL.patch,
             ),
-            AgentImpl { feed: feed.clone() },
+            agent.clone(),
         )
         .await
         {

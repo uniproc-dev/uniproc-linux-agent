@@ -14,6 +14,7 @@ mod rpc;
 mod seed;
 mod snapshots;
 mod tasks;
+mod units;
 mod wire;
 
 #[compio::main]
@@ -30,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let (_monitor, feed) = feed::start()?;
-    rpc::run(feed, read_shared_secret()?).await
+    let (_units_monitor, units) = units::start(feed.clone())?;
+    rpc::run(feed, units, read_shared_secret()?).await
 }
 
 /// The host writes a one-shot secret to our stdin and closes it, then uses the
