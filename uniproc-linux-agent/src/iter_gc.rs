@@ -1,8 +1,7 @@
-use crate::name_cache::NameCache;
 use libbpf_rs::{MapCore, MapMut};
 use rustc_hash::FxHashSet;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::{FromRawFd, RawFd};
 
@@ -34,10 +33,6 @@ impl IterGc {
         }
     }
 
-    pub fn live_pids(&mut self) -> &FxHashSet<u32> {
-        &self.live_pids_buf
-    }
-
     pub fn maybe_gc(&mut self, map: &mut MapMut) -> anyhow::Result<()> {
         self.tick += 1;
         if self.tick % self.every_n_ticks != 0 {
@@ -60,7 +55,7 @@ impl IterGc {
         let current = self.stale_buf.len() as f32;
         self.stale_ema = (self.stale_ema * (1.0 - EMA_ALPHA) + current * EMA_ALPHA).max(current);
 
-        let target_cap = ((self.stale_ema * 1.25) as usize);
+        let target_cap = (self.stale_ema * 1.25) as usize;
         if self.stale_buf.capacity() > target_cap * 2 {
             self.stale_buf.shrink_to(target_cap);
         }

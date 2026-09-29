@@ -7,7 +7,9 @@
 //! the same data straight from /proc.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -17,14 +19,15 @@ use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::accept_session;
-use uniproc_protocol::linux_capnp::{
-    self, EnvironmentKind, linux_agent, report_listener, watch_handle,
-};
+use uniproc_agent_kit::Tagged;
+use uniproc_protocol::linux_capnp::{agent_listener, linux_agent, lists_update, watch_handle};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
 use uniproc_protocol::{LINUX_PROTOCOL, WSL_AGENT_VSOCK_PORT};
 
+use crate::commands;
 use crate::feed::Feed;
-use crate::report::{LinuxEnvironmentKind, MachineStats, Report};
+use crate::model::{Key, Passports, Snapshot, States};
+use crate::wire::{self, Wanted};
 
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INTERVAL: Duration = Duration::from_secs(60);
@@ -35,36 +38,114 @@ struct AgentImpl {
     feed: Feed,
 }
 
+impl AgentImpl {
+    fn snapshot(&self) -> std::result::Result<Arc<Snapshot>, capnp::Error> {
+        self.feed
+            .latest
+            .get()
+            .map(|tagged| tagged.value)
+            .map_err(|e| capnp::Error::failed(format!("collect failed: {e}")))
+    }
+
+    fn command(&self, pid: u32, sequence_number: u64, run: impl FnOnce(u32) -> u32) -> u32 {
+        let Ok(snapshot) = self.snapshot() else {
+            return libc::EAGAIN as u32;
+        };
+        let range = Key { pid, sequence_number: 0 }..=Key { pid, sequence_number: u64::MAX };
+        let found = snapshot
+            .passports
+            .value
+            .range(range)
+            .map(|(_, p)| p)
+            .find(|p| sequence_number == 0 || p.key.sequence_number == sequence_number);
+        match found {
+            None => libc::ESRCH as u32,
+            Some(p) if p.view_pid == 0 => libc::EPERM as u32,
+            Some(p) => run(p.view_pid),
+        }
+    }
+}
+
+fn answer<T>(
+    tagged: &Tagged<T>,
+    if_none_match: u64,
+    mut meta: response_meta::Builder,
+) -> bool {
+    meta.set_etag(tagged.etag);
+    if tagged.unchanged_since(if_none_match) {
+        meta.set_status(ResponseStatus::NotModified);
+        return false;
+    }
+    meta.set_status(ResponseStatus::Ok);
+    true
+}
+
 impl linux_agent::Server for AgentImpl {
     async fn ping(
         self: Rc<Self>,
-        _: linux_agent::PingParams,
+        params: linux_agent::PingParams,
         mut results: linux_agent::PingResults,
     ) -> std::result::Result<(), capnp::Error> {
-        uncacheable(results.get().init_meta());
+        let nonce = params.get()?.get_nonce();
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_nonce(nonce);
         Ok(())
     }
 
-    async fn get_report(
+    async fn get_processes(
         self: Rc<Self>,
-        params: linux_agent::GetReportParams,
-        mut results: linux_agent::GetReportResults,
+        params: linux_agent::GetProcessesParams,
+        mut results: linux_agent::GetProcessesResults,
     ) -> std::result::Result<(), capnp::Error> {
         let if_none_match = params.get()?.get_meta()?.get_if_none_match();
-        let current = self
-            .feed
-            .latest
-            .get()
-            .map_err(|e| capnp::Error::failed(format!("collect failed: {e}")))?;
+        let snapshot = self.snapshot()?;
         let mut out = results.get();
-        let mut meta = out.reborrow().init_meta();
-        meta.set_etag(current.etag);
-        if current.unchanged_since(if_none_match) {
-            meta.set_status(ResponseStatus::NotModified);
+        if !answer(&snapshot.passports, if_none_match, out.reborrow().init_meta()) {
             return Ok(());
         }
-        meta.set_status(ResponseStatus::Ok);
-        build_report(&current.value, out.init_report());
+        let passports = &snapshot.passports.value;
+        let mut list = out.init_processes(passports.len() as u32);
+        for (i, passport) in passports.values().enumerate() {
+            wire::process_info(passport, list.reborrow().get(i as u32));
+        }
+        Ok(())
+    }
+
+    async fn get_process_states(
+        self: Rc<Self>,
+        params: linux_agent::GetProcessStatesParams,
+        mut results: linux_agent::GetProcessStatesResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let if_none_match = params.get()?.get_meta()?.get_if_none_match();
+        let snapshot = self.snapshot()?;
+        let mut out = results.get();
+        if !answer(&snapshot.states, if_none_match, out.reborrow().init_meta()) {
+            return Ok(());
+        }
+        out.set_passport_etag(snapshot.passports.etag);
+        let states = &snapshot.states.value;
+        let mut list = out.init_states(states.len() as u32);
+        for (i, state) in states.values().enumerate() {
+            wire::process_state(state, list.reborrow().get(i as u32));
+        }
+        Ok(())
+    }
+
+    async fn get_environments(
+        self: Rc<Self>,
+        params: linux_agent::GetEnvironmentsParams,
+        mut results: linux_agent::GetEnvironmentsResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let if_none_match = params.get()?.get_meta()?.get_if_none_match();
+        let snapshot = self.snapshot()?;
+        let mut out = results.get();
+        if !answer(&snapshot.environments, if_none_match, out.reborrow().init_meta()) {
+            return Ok(());
+        }
+        let e = &snapshot.environments.value;
+        wire::environments(e, out.reborrow().init_environments(e.environments.len() as u32));
+        wire::docker_containers(e, out.init_docker_containers(e.docker_containers.len() as u32));
         Ok(())
     }
 
@@ -74,17 +155,120 @@ impl linux_agent::Server for AgentImpl {
         mut results: linux_agent::WatchResults,
     ) -> std::result::Result<(), capnp::Error> {
         let params = params.get()?;
-        let interval = watch_interval(params.get_interval_ms());
+        let spec = params.get_spec()?;
+        let interval = watch_interval(spec.get_interval_ms());
+        let wanted = Wanted::read(spec)?;
         let listener = params.get_listener()?;
         let (abort, registration) = AbortHandle::new_pair();
         compio::runtime::spawn(Abortable::new(
-            push(self.feed.clone(), interval, listener),
+            push(self.feed.clone(), interval, wanted, listener),
             registration,
         ))
         .detach();
         let mut out = results.get();
         uncacheable(out.reborrow().init_meta());
         out.set_handle(capnp_rpc::new_client(WatchHandleImpl(abort)));
+        Ok(())
+    }
+
+    async fn kill(
+        self: Rc<Self>,
+        params: linux_agent::KillParams,
+        mut results: linux_agent::KillResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let code = self.command(p.get_pid(), seq, |pid| commands::signal(pid, seq, libc::SIGKILL as u32));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn terminate(
+        self: Rc<Self>,
+        params: linux_agent::TerminateParams,
+        mut results: linux_agent::TerminateResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let code = self.command(p.get_pid(), seq, |pid| commands::signal(pid, seq, libc::SIGTERM as u32));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn suspend(
+        self: Rc<Self>,
+        params: linux_agent::SuspendParams,
+        mut results: linux_agent::SuspendResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let code = self.command(p.get_pid(), seq, |pid| commands::signal(pid, seq, libc::SIGSTOP as u32));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn resume(
+        self: Rc<Self>,
+        params: linux_agent::ResumeParams,
+        mut results: linux_agent::ResumeResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let code = self.command(p.get_pid(), seq, |pid| commands::signal(pid, seq, libc::SIGCONT as u32));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn signal(
+        self: Rc<Self>,
+        params: linux_agent::SignalParams,
+        mut results: linux_agent::SignalResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let signal = p.get_signal();
+        let code = self.command(p.get_pid(), seq, |pid| commands::signal(pid, seq, signal));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn set_nice(
+        self: Rc<Self>,
+        params: linux_agent::SetNiceParams,
+        mut results: linux_agent::SetNiceResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let seq = p.get_sequence_number();
+        let nice = p.get_nice();
+        let code = self.command(p.get_pid(), seq, |pid| commands::set_nice(pid, seq, nice));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
+        Ok(())
+    }
+
+    async fn set_affinity(
+        self: Rc<Self>,
+        params: linux_agent::SetAffinityParams,
+        mut results: linux_agent::SetAffinityResults,
+    ) -> std::result::Result<(), capnp::Error> {
+        let p = params.get()?;
+        let mask: Vec<u64> = p.get_mask()?.iter().collect();
+        let seq = p.get_sequence_number();
+        let code = self.command(p.get_pid(), seq, |pid| commands::set_affinity(pid, seq, &mask));
+        let mut out = results.get();
+        uncacheable(out.reborrow().init_meta());
+        out.set_code(code);
         Ok(())
     }
 }
@@ -106,34 +290,465 @@ fn watch_interval(interval_ms: u32) -> Duration {
     Duration::from_millis(interval_ms.into()).clamp(MIN_INTERVAL, MAX_INTERVAL)
 }
 
-async fn push(feed: Feed, interval: Duration, listener: report_listener::Client) {
+/// What a listener last received: the lists its next deltas apply to.
+struct Sent {
+    number: u64,
+    passports: Tagged<Arc<Passports>>,
+    states: Tagged<Arc<States>>,
+    environments_etag: u64,
+}
+
+impl Sent {
+    fn of(snapshot: &Snapshot) -> Self {
+        Self {
+            number: snapshot.number,
+            passports: snapshot.passports.clone(),
+            states: snapshot.states.clone(),
+            environments_etag: snapshot.environments.etag,
+        }
+    }
+}
+
+async fn push(feed: Feed, interval: Duration, wanted: Wanted, listener: agent_listener::Client) {
     let _lease = feed.lease(interval);
     let mut generation = feed.fresh.generation();
-    let mut sent = 0;
+    let mut sent: Option<Sent> = None;
     loop {
         if let Ok(current) = feed.latest.get()
-            && current.etag != sent
+            && sent.as_ref().is_none_or(|s| s.number != current.value.number)
         {
+            let snapshot = &current.value;
             let started = Instant::now();
             let mut request = listener.update_request();
             let mut out = request.get();
             out.reborrow().init_meta();
-            out.set_etag(current.etag);
-            build_report(&current.value, out.init_report());
+            lists(sent.as_ref(), snapshot, out.reborrow().init_lists());
+            wire::columns(snapshot, wanted, out.reborrow().init_processes());
+            wire::machine(snapshot, wanted, out.init_machine());
             if let Err(e) = request.send().promise.await {
                 tracing::info!("watch ended by its listener: {e}");
                 return;
             }
-            sent = current.etag;
+            sent = Some(Sent::of(snapshot));
             compio::time::sleep(interval.saturating_sub(started.elapsed())).await;
         }
         generation = feed.fresh.changed(generation).await;
     }
 }
 
+/// Keys that left `base`, and rows of `now` that are new or differ from `base`.
+fn changes<'a, V: PartialEq>(
+    base: &BTreeMap<Key, V>,
+    now: &'a BTreeMap<Key, V>,
+) -> (Vec<Key>, Vec<&'a V>) {
+    let left = base.keys().filter(|k| !now.contains_key(k)).copied().collect();
+    let upserted = now
+        .iter()
+        .filter(|(k, v)| base.get(k) != Some(v))
+        .map(|(_, v)| v)
+        .collect();
+    (left, upserted)
+}
+
+fn lists(sent: Option<&Sent>, snapshot: &Snapshot, mut out: lists_update::Builder) {
+    out.set_passport_etag(snapshot.passports.etag);
+    out.set_states_etag(snapshot.states.etag);
+    out.set_environments_etag(snapshot.environments.etag);
+
+    let passports = &snapshot.passports.value;
+    match sent.map(|s| &s.passports) {
+        Some(base) if base.etag == snapshot.passports.etag => {
+            out.reborrow().init_passports().set_unchanged(())
+        }
+        Some(base) => {
+            let (left, upserted) = changes(&base.value, passports);
+            let mut delta = out.reborrow().init_passports().init_delta();
+            delta.set_base_etag(base.etag);
+            let mut list = delta.reborrow().init_left(left.len() as u32);
+            for (i, key) in left.iter().enumerate() {
+                wire::process_key(*key, list.reborrow().get(i as u32));
+            }
+            let mut list = delta.init_upserted(upserted.len() as u32);
+            for (i, passport) in upserted.iter().enumerate() {
+                wire::process_info(passport, list.reborrow().get(i as u32));
+            }
+        }
+        None => {
+            let mut list = out.reborrow().init_passports().init_full(passports.len() as u32);
+            for (i, passport) in passports.values().enumerate() {
+                wire::process_info(passport, list.reborrow().get(i as u32));
+            }
+        }
+    }
+
+    let states = &snapshot.states.value;
+    match sent.map(|s| &s.states) {
+        Some(base) if base.etag == snapshot.states.etag => {
+            out.reborrow().init_states().set_unchanged(())
+        }
+        Some(base) => {
+            let (left, upserted) = changes(&base.value, states);
+            let mut delta = out.reborrow().init_states().init_delta();
+            delta.set_base_etag(base.etag);
+            let mut list = delta.reborrow().init_left(left.len() as u32);
+            for (i, key) in left.iter().enumerate() {
+                wire::process_key(*key, list.reborrow().get(i as u32));
+            }
+            let mut list = delta.init_upserted(upserted.len() as u32);
+            for (i, state) in upserted.iter().enumerate() {
+                wire::process_state(state, list.reborrow().get(i as u32));
+            }
+        }
+        None => {
+            let mut list = out.reborrow().init_states().init_full(states.len() as u32);
+            for (i, state) in states.values().enumerate() {
+                wire::process_state(state, list.reborrow().get(i as u32));
+            }
+        }
+    }
+
+    match sent {
+        Some(s) if s.environments_etag == snapshot.environments.etag => {
+            out.init_environments().set_unchanged(())
+        }
+        _ => {
+            let e = &snapshot.environments.value;
+            let mut full = out.init_environments().init_full();
+            wire::environments(e, full.reborrow().init_environments(e.environments.len() as u32));
+            wire::docker_containers(e, full.init_docker_containers(e.docker_containers.len() as u32));
+        }
+    }
+}
+
 fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_etag(0);
     meta.set_status(ResponseStatus::Ok);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use uniproc_agent_kit::{Epoch, Versioned};
+    use uniproc_protocol::linux_capnp::{MachineMetric, ProcessMetric, lists_update};
+
+    use super::*;
+    use crate::model::{Environments, Machine, MachineMemory, Passport, Row, SchedPolicy, State, TaskState};
+
+    fn key(pid: u32) -> Key {
+        Key {
+            pid,
+            sequence_number: 1_000 + pid as u64,
+        }
+    }
+
+    fn passport(pid: u32) -> Arc<Passport> {
+        passport_at(key(pid))
+    }
+
+    fn passport_at(key: Key) -> Arc<Passport> {
+        let pid = key.pid;
+        Arc::new(Passport {
+            key,
+            view_pid: pid,
+            parent_pid: 1,
+            start_time: 0,
+            name: format!("p{pid}"),
+            exe_path: String::new(),
+            cmdline: vec![format!("p{pid}"), "-x".into()],
+            uid: 0,
+            user: "root".into(),
+            local_pid: pid,
+            mnt_ns: 1,
+            pid_ns: 2,
+            cgroup: "/".into(),
+        })
+    }
+
+    fn state(pid: u32, nice: i32) -> State {
+        State {
+            key: key(pid),
+            state: TaskState::Sleeping,
+            nice,
+            policy: SchedPolicy::Other,
+            rt_priority: 0,
+        }
+    }
+
+    struct Lists {
+        passports: Versioned<Arc<Passports>>,
+        states: Versioned<Arc<States>>,
+        environments: Versioned<Arc<Environments>>,
+        number: u64,
+    }
+
+    impl Lists {
+        fn new() -> Self {
+            let epoch = Epoch::new();
+            Self {
+                passports: Versioned::new(epoch, Arc::default()),
+                states: Versioned::new(epoch, Arc::default()),
+                environments: Versioned::new(epoch, Arc::default()),
+                number: 0,
+            }
+        }
+
+        fn publish(&mut self, feed: &Feed, processes: &[(u32, i32)]) {
+            self.passports
+                .set(Arc::new(processes.iter().map(|&(pid, _)| (key(pid), passport(pid))).collect()));
+            self.states
+                .set(Arc::new(processes.iter().map(|&(pid, nice)| (key(pid), state(pid, nice))).collect()));
+            self.number += 1;
+            let rows = processes
+                .iter()
+                .map(|&(pid, _)| Row {
+                    key: key(pid),
+                    cpu_user_time: pid as u64 * 10,
+                    ..Default::default()
+                })
+                .collect();
+            feed.latest.replace(Snapshot {
+                number: self.number,
+                sampled_at: self.number * 100,
+                passports: self.passports.get().clone(),
+                states: self.states.get().clone(),
+                environments: self.environments.get().clone(),
+                rows: Arc::new(rows),
+                machine: Arc::new(Machine {
+                    memory: Some(MachineMemory {
+                        total: 4096,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            });
+            feed.fresh.notify();
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Update {
+        passports: String,
+        passport_etag: u64,
+        states: String,
+        pids: Vec<u32>,
+        cpu_user_time: Option<Vec<u64>>,
+        resident_set_present: bool,
+        memory_total: Option<u64>,
+        cpu_present: bool,
+    }
+
+    fn keys(list: capnp::struct_list::Reader<uniproc_protocol::linux_capnp::process_key::Owned>) -> String {
+        list.iter().map(|k| k.get_pid().to_string()).collect::<Vec<_>>().join(",")
+    }
+
+    struct Recorder(Rc<RefCell<Vec<Update>>>);
+
+    impl agent_listener::Server for Recorder {
+        async fn update(
+            self: Rc<Self>,
+            params: agent_listener::UpdateParams,
+            _: agent_listener::UpdateResults,
+        ) -> std::result::Result<(), capnp::Error> {
+            let p = params.get()?;
+            let lists = p.get_lists()?;
+            let passports = match lists.get_passports().which()? {
+                lists_update::passports::Unchanged(()) => "unchanged".to_string(),
+                lists_update::passports::Full(full) => {
+                    let full = full?;
+                    format!("full:{}", full.iter().map(|p| p.get_pid().to_string()).collect::<Vec<_>>().join(","))
+                }
+                lists_update::passports::Delta(delta) => {
+                    let delta = delta?;
+                    format!(
+                        "delta:-{}+{}",
+                        keys(delta.get_left()?),
+                        delta.get_upserted()?.iter().map(|p| p.get_pid().to_string()).collect::<Vec<_>>().join(",")
+                    )
+                }
+            };
+            let states = match lists.get_states().which()? {
+                lists_update::states::Unchanged(()) => "unchanged".to_string(),
+                lists_update::states::Full(full) => format!("full:{}", full?.len()),
+                lists_update::states::Delta(delta) => {
+                    let delta = delta?;
+                    format!("delta:-{}+{}", keys(delta.get_left()?), delta.get_upserted()?.len())
+                }
+            };
+            let columns = p.get_processes()?;
+            let machine = p.get_machine()?;
+            self.0.borrow_mut().push(Update {
+                passports,
+                passport_etag: lists.get_passport_etag(),
+                states,
+                pids: columns.get_pids()?.iter().collect(),
+                cpu_user_time: columns.has_cpu_user_time().then(|| columns.get_cpu_user_time().unwrap().iter().collect()),
+                resident_set_present: columns.has_resident_set(),
+                memory_total: machine.has_memory().then(|| machine.get_memory().unwrap().get_total()),
+                cpu_present: machine.has_cpu(),
+            });
+            Ok(())
+        }
+
+        async fn ended(
+            self: Rc<Self>,
+            _: agent_listener::EndedParams,
+            _: agent_listener::EndedResults,
+        ) -> std::result::Result<(), capnp::Error> {
+            Ok(())
+        }
+    }
+
+    async fn until(what: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !what() {
+            assert!(Instant::now() < deadline, "timed out");
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    fn agent(feed: &Feed) -> linux_agent::Client {
+        capnp_rpc::new_client(AgentImpl { feed: feed.clone() })
+    }
+
+    #[compio::test]
+    async fn get_processes_answers_not_modified_while_the_passports_hold() {
+        let feed = Feed::without_collector();
+        let mut lists = Lists::new();
+        lists.publish(&feed, &[(10, 0), (11, 0)]);
+        let agent = agent(&feed);
+
+        let response = agent.get_processes_request().send().promise.await.unwrap();
+        let answer = response.get().unwrap();
+        let etag = answer.get_meta().unwrap().get_etag();
+        assert_eq!(answer.get_processes().unwrap().len(), 2);
+        assert_eq!(answer.get_processes().unwrap().get(0).get_cmdline().unwrap().len(), 2);
+
+        lists.publish(&feed, &[(10, 5), (11, 0)]);
+        let mut request = agent.get_processes_request();
+        request.get().init_meta().set_if_none_match(etag);
+        let response = request.send().promise.await.unwrap();
+        let meta = response.get().unwrap().get_meta().unwrap();
+        assert_eq!(meta.get_status().unwrap(), ResponseStatus::NotModified);
+        assert!(!response.get().unwrap().has_processes());
+
+        let mut request = agent.get_process_states_request();
+        request.get().init_meta().set_if_none_match(etag);
+        let response = request.send().promise.await.unwrap();
+        let answer = response.get().unwrap();
+        assert_eq!(answer.get_meta().unwrap().get_status().unwrap(), ResponseStatus::Ok);
+        assert_eq!(answer.get_passport_etag(), etag);
+        assert_eq!(answer.get_states().unwrap().get(0).get_nice(), 5);
+    }
+
+    #[compio::test]
+    async fn a_watch_sends_full_lists_then_deltas_and_only_the_columns_asked_for() {
+        let feed = Feed::without_collector();
+        let mut lists = Lists::new();
+        lists.publish(&feed, &[(10, 0), (11, 0)]);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let mut request = agent(&feed).watch_request();
+        {
+            let mut spec = request.get().init_spec();
+            spec.set_interval_ms(100);
+            spec.reborrow().init_processes(1).set(0, ProcessMetric::CpuUserTime);
+            spec.init_machine(1).set(0, MachineMetric::Memory);
+        }
+        request.get().set_listener(capnp_rpc::new_client(Recorder(seen.clone())));
+        let response = request.send().promise.await.unwrap();
+        let handle = response.get().unwrap().get_handle().unwrap();
+
+        until(|| seen.borrow().len() == 1).await;
+        {
+            let seen = seen.borrow();
+            let first = &seen[0];
+            assert_eq!(first.passports, "full:10,11");
+            assert_eq!(first.states, "full:2");
+            assert_eq!(first.pids, vec![10, 11]);
+            assert_eq!(first.cpu_user_time, Some(vec![100, 110]));
+            assert!(!first.resident_set_present);
+            assert_eq!(first.memory_total, Some(4096));
+            assert!(!first.cpu_present);
+        }
+
+        lists.publish(&feed, &[(11, 3), (12, 0)]);
+        until(|| seen.borrow().len() == 2).await;
+        {
+            let seen = seen.borrow();
+            assert_eq!(seen[1].passports, "delta:-10+12");
+            assert_eq!(seen[1].states, "delta:-10+2");
+            assert_eq!(seen[1].pids, vec![11, 12]);
+            assert_ne!(seen[1].passport_etag, seen[0].passport_etag);
+        }
+
+        lists.publish(&feed, &[(11, 3), (12, 0)]);
+        until(|| seen.borrow().len() == 3).await;
+        assert_eq!(seen.borrow()[2].passports, "unchanged");
+        assert_eq!(seen.borrow()[2].states, "unchanged");
+
+        drop(handle);
+        drop(response);
+        until(|| feed.period() == Duration::from_secs(1)).await;
+    }
+
+    #[compio::test]
+    async fn commands_reach_the_process_they_name_and_nothing_else() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let ticks = crate::procfs::start_ticks(pid).unwrap();
+        let sequence_number = ticks * (1_000_000_000 / crate::procfs::user_hz());
+        let feed = Feed::without_collector();
+        let child_key = Key { pid, sequence_number };
+        let mut snapshot = Snapshot::empty();
+        snapshot.passports.value = Arc::new([(child_key, passport_at(child_key))].into_iter().collect());
+        feed.latest.replace(snapshot);
+        let agent = agent(&feed);
+
+        let mut request = agent.signal_request();
+        request.get().set_pid(pid + 1_000_000);
+        request.get().set_signal(0);
+        let code = request.send().promise.await.unwrap().get().unwrap().get_code();
+        assert_eq!(code, libc::ESRCH as u32);
+
+        let mut request = agent.kill_request();
+        request.get().set_pid(pid);
+        request.get().set_sequence_number(sequence_number + 60_000_000_000);
+        let code = request.send().promise.await.unwrap().get().unwrap().get_code();
+        assert_eq!(code, libc::ESRCH as u32);
+
+        let mut request = agent.set_nice_request();
+        request.get().set_pid(pid);
+        request.get().set_sequence_number(sequence_number);
+        request.get().set_nice(10);
+        assert_eq!(request.send().promise.await.unwrap().get().unwrap().get_code(), 0);
+        let nice = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) };
+        assert_eq!(nice, 10);
+
+        let mut request = agent.kill_request();
+        request.get().set_pid(pid);
+        request.get().set_sequence_number(sequence_number);
+        assert_eq!(request.send().promise.await.unwrap().get().unwrap().get_code(), 0);
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[compio::test]
+    async fn ping_echoes_its_nonce() {
+        let mut request = agent(&Feed::without_collector()).ping_request();
+        request.get().set_nonce(0xdead_beef);
+        let response = request.send().promise.await.unwrap();
+        assert_eq!(response.get().unwrap().get_nonce(), 0xdead_beef);
+    }
+
+    #[test]
+    fn an_interval_is_clamped_and_zero_means_a_second() {
+        assert_eq!(watch_interval(0), Duration::from_secs(1));
+        assert_eq!(watch_interval(1), Duration::from_millis(100));
+        assert_eq!(watch_interval(500), Duration::from_millis(500));
+        assert_eq!(watch_interval(u32::MAX), Duration::from_secs(60));
+    }
 }
 
 pub async fn run(feed: Feed, secret: Vec<u8>) -> Result<()> {
@@ -197,325 +812,5 @@ async fn serve_loop(listener: Listener, feed: Feed, handshake: HandshakeMode) ->
             }
         })
         .detach();
-    }
-}
-
-fn build_report(report: &Report, mut out: linux_capnp::report::Builder) {
-    build_machine_stats(&report.machine, out.reborrow().init_machine());
-
-    let processes = &report.processes;
-    let mut list = out.reborrow().init_processes(processes.len() as u32);
-    for (i, p) in processes.iter().enumerate() {
-        let mut dst = list.reborrow().get(i as u32);
-        dst.set_global_pid(p.global_pid);
-        dst.set_local_pid(p.local_pid);
-        dst.set_mnt_ns(p.mnt_ns);
-        dst.set_pid_ns(p.pid_ns);
-        dst.set_name(process_name(&p.name));
-
-        dst.set_cpu_percent(p.cpu_percent);
-        dst.set_rss_kb(p.rss_kb);
-        dst.set_last_active_ns(p.last_active_ns);
-
-        dst.set_vsock_rx_bytes(p.vsock_rx_bytes);
-        dst.set_vsock_tx_bytes(p.vsock_tx_bytes);
-        dst.set_p9_rx_bytes(p.p9_rx_bytes);
-        dst.set_p9_tx_bytes(p.p9_tx_bytes);
-
-        dst.set_tcp_tx_lo_bytes(p.tcp_tx_lo_bytes);
-        dst.set_tcp_rx_lo_bytes(p.tcp_rx_lo_bytes);
-        dst.set_tcp_tx_remote_bytes(p.tcp_tx_remote_bytes);
-        dst.set_tcp_rx_remote_bytes(p.tcp_rx_remote_bytes);
-        dst.set_udp_tx_lo_bytes(p.udp_tx_lo_bytes);
-        dst.set_udp_rx_lo_bytes(p.udp_rx_lo_bytes);
-        dst.set_udp_tx_remote_bytes(p.udp_tx_remote_bytes);
-        dst.set_udp_rx_remote_bytes(p.udp_rx_remote_bytes);
-        dst.set_uds_tx_bytes(p.uds_tx_bytes);
-        dst.set_uds_rx_bytes(p.uds_rx_bytes);
-
-        dst.set_disk_read_bytes(p.disk_read_bytes);
-        dst.set_disk_write_bytes(p.disk_write_bytes);
-        dst.set_disk_read_iops(p.disk_read_iops);
-        dst.set_disk_write_iops(p.disk_write_iops);
-
-        dst.set_pipe_read_bytes(p.pipe_read_bytes);
-        dst.set_pipe_write_bytes(p.pipe_write_bytes);
-        dst.set_sendfile_bytes(p.sendfile_bytes);
-    }
-
-    let environments = &report.environments;
-    let mut list = out
-        .reborrow()
-        .init_environments(environments.len() as u32);
-    for (i, e) in environments.iter().enumerate() {
-        let mut dst = list.reborrow().get(i as u32);
-        dst.set_mnt_ns(e.mnt_ns);
-        dst.set_pid_ns(e.pid_ns);
-        match &e.kind {
-            LinuxEnvironmentKind::Unknown => {
-                dst.set_kind(EnvironmentKind::Unknown);
-            }
-            LinuxEnvironmentKind::CurrentDistro { name } => {
-                dst.set_kind(EnvironmentKind::CurrentDistro);
-                dst.set_name(name);
-            }
-            LinuxEnvironmentKind::DockerContainer { id } => {
-                dst.set_kind(EnvironmentKind::DockerContainer);
-                dst.set_name(id);
-            }
-            LinuxEnvironmentKind::UnknownExternalNamespace => {
-                dst.set_kind(EnvironmentKind::UnknownExternalNamespace);
-            }
-        }
-    }
-
-    let docker_containers = &report.docker_containers;
-    let mut list = out
-        .reborrow()
-        .init_docker_containers(docker_containers.len() as u32);
-    for (i, c) in docker_containers.iter().enumerate() {
-        let mut dst = list.reborrow().get(i as u32);
-        dst.set_id(c.id.as_str());
-        dst.set_mnt_ns(c.mnt_ns);
-        dst.set_pid_ns(c.pid_ns);
-        dst.set_api_version(c.api_version.as_str());
-        dst.set_raw_json(c.raw_json.as_str());
-    }
-}
-
-fn build_machine_stats(m: &MachineStats, mut out: linux_capnp::machine_stats::Builder) {
-    out.set_total_kb(m.total_kb);
-    out.set_free_kb(m.free_kb);
-    out.set_available_kb(m.available_kb);
-    out.set_used_kb(m.used_kb);
-    out.set_cached_kb(m.cached_kb);
-
-    out.set_busy_ns(m.busy_ns);
-    out.set_last_tsc(m.last_tsc);
-
-    out.set_vsock_rx_bytes(m.vsock_rx_bytes);
-    out.set_vsock_tx_bytes(m.vsock_tx_bytes);
-    out.set_p9_rx_bytes(m.p9_rx_bytes);
-    out.set_p9_tx_bytes(m.p9_tx_bytes);
-
-    out.set_tcp_tx_lo_bytes(m.tcp_tx_lo_bytes);
-    out.set_tcp_rx_lo_bytes(m.tcp_rx_lo_bytes);
-    out.set_tcp_tx_remote_bytes(m.tcp_tx_remote_bytes);
-    out.set_tcp_rx_remote_bytes(m.tcp_rx_remote_bytes);
-    out.set_udp_tx_lo_bytes(m.udp_tx_lo_bytes);
-    out.set_udp_rx_lo_bytes(m.udp_rx_lo_bytes);
-    out.set_udp_tx_remote_bytes(m.udp_tx_remote_bytes);
-    out.set_udp_rx_remote_bytes(m.udp_rx_remote_bytes);
-    out.set_uds_tx_bytes(m.uds_tx_bytes);
-    out.set_uds_rx_bytes(m.uds_rx_bytes);
-
-    out.set_disk_read_bytes(m.disk_read_bytes);
-    out.set_disk_write_bytes(m.disk_write_bytes);
-    out.set_disk_read_iops(m.disk_read_iops);
-    out.set_disk_write_iops(m.disk_write_iops);
-
-    out.set_pipe_read_bytes(m.pipe_read_bytes);
-    out.set_pipe_write_bytes(m.pipe_write_bytes);
-    out.set_sendfile_bytes(m.sendfile_bytes);
-    out.set_cpu_count(m.cpu_count);
-}
-
-/// Kernel task names are NUL-padded fixed buffers; expose the &str up to the
-/// first NUL.
-fn process_name(name: &[u8; 64]) -> &str {
-    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
-    std::str::from_utf8(&name[..end]).unwrap_or("<invalid>")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, ProcessStats};
-
-    fn process(global_pid: u32, name: &str) -> ProcessStats {
-        let mut padded = [0u8; 64];
-        padded[..name.len()].copy_from_slice(name.as_bytes());
-        ProcessStats {
-            global_pid,
-            local_pid: 1,
-            mnt_ns: 10,
-            pid_ns: 20,
-            name: padded,
-            cpu_percent: 12.5,
-            rss_kb: 2048,
-            last_active_ns: 3,
-            vsock_rx_bytes: 4,
-            vsock_tx_bytes: 5,
-            p9_rx_bytes: 6,
-            p9_tx_bytes: 7,
-            tcp_tx_lo_bytes: 8,
-            tcp_rx_lo_bytes: 9,
-            tcp_tx_remote_bytes: 10,
-            tcp_rx_remote_bytes: 11,
-            udp_tx_lo_bytes: 12,
-            udp_rx_lo_bytes: 13,
-            udp_tx_remote_bytes: 14,
-            udp_rx_remote_bytes: 15,
-            uds_tx_bytes: 16,
-            uds_rx_bytes: 17,
-            disk_read_bytes: 18,
-            disk_write_bytes: 19,
-            disk_read_iops: 20,
-            disk_write_iops: 21,
-            pipe_read_bytes: 22,
-            pipe_write_bytes: 23,
-            sendfile_bytes: 24,
-        }
-    }
-
-    fn round_trip(report: &Report) -> capnp::message::Builder<capnp::message::HeapAllocator> {
-        let mut message = capnp::message::Builder::new_default();
-        build_report(report, message.init_root());
-        message
-    }
-
-    #[test]
-    fn a_report_reads_back_as_it_was_built() {
-        let mut report = Report::default();
-        report.machine.total_kb = 16_000_000;
-        report.machine.busy_ns = 42;
-        report.machine.cpu_count = 16;
-        report.processes.push(process(4242, "bash"));
-        report.environments.push(LinuxEnvironmentInfo {
-            mnt_ns: 10,
-            pid_ns: 20,
-            kind: LinuxEnvironmentKind::CurrentDistro {
-                name: "Ubuntu 24.04.3 LTS".into(),
-            },
-        });
-        report.environments.push(LinuxEnvironmentInfo {
-            mnt_ns: 30,
-            pid_ns: 40,
-            kind: LinuxEnvironmentKind::UnknownExternalNamespace,
-        });
-        report.docker_containers.push(LinuxDockerContainerInfo {
-            id: "abc123".into(),
-            mnt_ns: 50,
-            pid_ns: 60,
-            api_version: "v1.43".into(),
-            raw_json: "{}".into(),
-        });
-
-        let message = round_trip(&report);
-        let read = message
-            .get_root_as_reader::<linux_capnp::report::Reader>()
-            .unwrap();
-
-        let machine = read.get_machine().unwrap();
-        assert_eq!(machine.get_total_kb(), 16_000_000);
-        assert_eq!(machine.get_busy_ns(), 42);
-        assert_eq!(machine.get_cpu_count(), 16);
-
-        let processes = read.get_processes().unwrap();
-        assert_eq!(processes.len(), 1);
-        let p = processes.get(0);
-        assert_eq!(p.get_global_pid(), 4242);
-        assert_eq!(p.get_name().unwrap().to_str().unwrap(), "bash");
-        assert_eq!(p.get_cpu_percent(), 12.5);
-        assert_eq!(p.get_rss_kb(), 2048);
-        assert_eq!(p.get_uds_rx_bytes(), 17);
-        assert_eq!(p.get_sendfile_bytes(), 24);
-
-        let environments = read.get_environments().unwrap();
-        assert_eq!(environments.len(), 2);
-        let distro = environments.get(0);
-        assert_eq!(distro.get_kind().unwrap(), EnvironmentKind::CurrentDistro);
-        assert_eq!(
-            distro.get_name().unwrap().to_str().unwrap(),
-            "Ubuntu 24.04.3 LTS"
-        );
-        assert_eq!(
-            environments.get(1).get_kind().unwrap(),
-            EnvironmentKind::UnknownExternalNamespace
-        );
-
-        let containers = read.get_docker_containers().unwrap();
-        assert_eq!(containers.len(), 1);
-        assert_eq!(containers.get(0).get_id().unwrap().to_str().unwrap(), "abc123");
-        assert_eq!(containers.get(0).get_pid_ns(), 60);
-    }
-
-    struct Recorder(Rc<std::cell::RefCell<Vec<(u64, u64)>>>);
-
-    impl report_listener::Server for Recorder {
-        async fn update(
-            self: Rc<Self>,
-            params: report_listener::UpdateParams,
-            _: report_listener::UpdateResults,
-        ) -> std::result::Result<(), capnp::Error> {
-            let params = params.get()?;
-            let total_kb = params.get_report()?.get_machine()?.get_total_kb();
-            self.0.borrow_mut().push((params.get_etag(), total_kb));
-            Ok(())
-        }
-    }
-
-    fn publish(feed: &Feed, total_kb: u64) {
-        let mut report = Report::default();
-        report.machine.total_kb = total_kb;
-        feed.latest.set(report);
-        feed.fresh.notify();
-    }
-
-    async fn until(what: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !what() {
-            assert!(Instant::now() < deadline, "timed out");
-            compio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    #[compio::test]
-    async fn a_watch_pushes_each_new_report_until_its_handle_is_released() {
-        let feed = Feed::without_collector();
-        publish(&feed, 1);
-        let agent: linux_agent::Client = capnp_rpc::new_client(AgentImpl { feed: feed.clone() });
-        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
-        let listener: report_listener::Client = capnp_rpc::new_client(Recorder(seen.clone()));
-
-        let mut request = agent.watch_request();
-        request.get().init_meta();
-        request.get().set_interval_ms(100);
-        request.get().set_listener(listener);
-        let response = request.send().promise.await.unwrap();
-        let handle = response.get().unwrap().get_handle().unwrap();
-
-        until(|| seen.borrow().len() == 1).await;
-        assert_eq!(seen.borrow()[0], (feed.latest.get().unwrap().etag, 1));
-        assert_eq!(feed.period(), Duration::from_millis(100));
-
-        publish(&feed, 2);
-        until(|| seen.borrow().len() == 2).await;
-        assert_eq!(seen.borrow()[1].1, 2);
-
-        feed.fresh.notify();
-        compio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(seen.borrow().len(), 2);
-
-        drop(handle);
-        drop(response);
-        until(|| feed.period() == Duration::from_secs(1)).await;
-        publish(&feed, 3);
-        compio::time::sleep(Duration::from_millis(250)).await;
-        assert_eq!(seen.borrow().len(), 2);
-    }
-
-    #[test]
-    fn an_interval_is_clamped_and_zero_means_a_second() {
-        assert_eq!(watch_interval(0), Duration::from_secs(1));
-        assert_eq!(watch_interval(1), Duration::from_millis(100));
-        assert_eq!(watch_interval(500), Duration::from_millis(500));
-        assert_eq!(watch_interval(u32::MAX), Duration::from_secs(60));
-    }
-
-    #[test]
-    fn a_name_without_a_nul_is_taken_whole() {
-        let name = [b'a'; 64];
-        assert_eq!(process_name(&name).len(), 64);
     }
 }

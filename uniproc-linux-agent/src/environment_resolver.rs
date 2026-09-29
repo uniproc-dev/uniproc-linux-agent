@@ -4,9 +4,8 @@ use std::os::unix::net::UnixStream;
 
 use rustc_hash::FxHashMap;
 use serde_json::Value;
-use crate::report::{
-    LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind, ProcessStats,
-};
+use crate::model::Passport;
+use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind};
 
 const DOCKER_API_VERSION: &str = "v1.41";
 const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
@@ -14,7 +13,6 @@ const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 #[derive(Clone, Copy)]
 struct NamespaceRep {
     pid_ns: u64,
-    global_pid: u32,
 }
 
 pub struct EnvironmentResolver {
@@ -46,24 +44,23 @@ impl EnvironmentResolver {
     /// us over eBPF. `local_pid == 1` is the init of *some* pid namespace (a
     /// container's init qualifies too), so it is only ours when the pid
     /// namespace matches.
-    fn init_mnt_ns(&self, processes: &[ProcessStats]) -> Option<u64> {
+    fn init_mnt_ns<'p>(&self, processes: impl Iterator<Item = &'p Passport>) -> Option<u64> {
         processes
-            .iter()
+            .into_iter()
             .find(|p| p.local_pid == 1 && Some(p.pid_ns) == self.own_pid_ns)
             .map(|p| p.mnt_ns)
     }
 
-    pub fn resolve(
+    pub fn resolve<'p>(
         &self,
-        processes: &[ProcessStats],
+        processes: impl Iterator<Item = &'p Passport> + Clone,
     ) -> (Vec<LinuxEnvironmentInfo>, Vec<LinuxDockerContainerInfo>) {
         let mut namespaces = FxHashMap::default();
-        for process in processes {
+        for process in processes.clone() {
             namespaces
                 .entry(process.mnt_ns)
                 .or_insert(NamespaceRep {
                     pid_ns: process.pid_ns,
-                    global_pid: process.global_pid,
                 });
         }
 
@@ -228,7 +225,7 @@ fn parse_os_release_field(content: &str, key: &str) -> Option<String> {
     Some(value.trim().trim_matches('"').to_string())
 }
 
-fn read_namespace_inode(pid: u32, namespace: &str) -> Option<u64> {
+pub fn read_namespace_inode(pid: u32, namespace: &str) -> Option<u64> {
     let target = fs::read_link(format!("/proc/{pid}/ns/{namespace}")).ok()?;
     let target = target.to_string_lossy();
     let start = target.find('[')? + 1;

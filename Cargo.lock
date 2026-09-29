@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "uniproc-linux-agent"
-version = "0.6.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "capnp",
@@ -1682,8 +1682,8 @@ dependencies = [
 
 [[package]]
 name = "uniproc-protocol"
-version = "0.12.7"
-source = "git+https://github.com/uniproc-dev/uniproc-protocol?tag=v0.12.7#e2d5e34f870dfb0ace024c60b9f0a4ee0582a1bf"
+version = "0.13.1"
+source = "git+https://github.com/uniproc-dev/uniproc-protocol?tag=v0.13.1#de1d6ec78544ec901ee8ea79c37ab2e3a80813e9"
 dependencies = [
  "capnp",
  "capnp-rpc",

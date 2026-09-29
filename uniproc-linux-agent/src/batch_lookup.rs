@@ -1,4 +1,4 @@
-use crate::process_metrics_state::RawProcessStats;
+use crate::probes::RawProcessStats;
 use libbpf_rs::MapCore;
 use std::io;
 use std::mem::size_of;

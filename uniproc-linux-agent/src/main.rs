@@ -2,14 +2,19 @@ use tracing_subscriber::filter::LevelFilter;
 
 mod batch_lookup;
 mod bpf;
+mod commands;
 mod environment_resolver;
 mod feed;
 mod iter_gc;
-mod name_cache;
-mod process_metrics_state;
+mod model;
+mod probes;
+mod procfs;
 mod report;
 mod rpc;
 mod seed;
+mod snapshots;
+mod tasks;
+mod wire;
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {

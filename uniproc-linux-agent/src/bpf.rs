@@ -1,15 +1,16 @@
 use crate::batch_lookup::BatchLookup;
-use crate::environment_resolver::EnvironmentResolver;
+use crate::environment_resolver::read_namespace_inode;
 use crate::iter_gc::IterGc;
-use crate::name_cache::NameCache;
-use crate::process_metrics_state::ProcessMetricsState;
+use crate::model::{Probed, Transports};
+use crate::probes;
 use crate::seed;
+use crate::tasks::{Task, TaskReader};
 use anyhow::anyhow;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject};
+use rustc_hash::FxHashMap;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd};
-use crate::report::{MachineStats, Report};
 
 mod prog {
     include!(concat!(env!("OUT_DIR"), "/prog.skel.rs"));
@@ -19,17 +20,30 @@ use prog::{ProgSkel, ProgSkelBuilder};
 pub struct BpfAgent<'a> {
     skel: ProgSkel<'a>,
     gc: IterGc,
-    cache: NameCache,
     batch: BatchLookup,
-    metrics: ProcessMetricsState,
-    environments: EnvironmentResolver,
+    tasks: TaskReader,
+}
+
+/// What the kernel side holds at one moment.
+pub struct Sample {
+    pub tasks: Vec<Task>,
+    pub probed: FxHashMap<u32, Probed>,
+    pub transports: Option<Transports>,
 }
 
 impl<'a> BpfAgent<'a> {
     pub fn init(open_object: &'a mut MaybeUninit<OpenObject>) -> anyhow::Result<Self> {
         setup_rlimits()?;
 
-        let open_skel = ProgSkelBuilder::default().open(open_object)?;
+        let mut open_skel = ProgSkelBuilder::default().open(open_object)?;
+        let own_pid_ns = read_namespace_inode(std::process::id(), "pid")
+            .ok_or_else(|| anyhow!("cannot read the agent's own pid namespace"))?;
+        open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .ok_or_else(|| anyhow!("the BPF object has no rodata"))?
+            .agent_pid_ns = own_pid_ns;
         let mut skel = open_skel.load()?;
 
         setup_mem_config(&mut skel)?;
@@ -40,55 +54,52 @@ impl<'a> BpfAgent<'a> {
         seed::seed_existing_processes(seed_fd)?;
 
         let iter_fd = skel.progs.list_processes.as_fd().as_raw_fd();
-        let names_fd = skel.progs.task_names.as_fd().as_raw_fd();
 
         Ok(Self {
             gc: IterGc::new(10, iter_fd),
-            cache: NameCache::new(names_fd),
             batch: BatchLookup::new(),
-            metrics: ProcessMetricsState::new(libbpf_rs::num_possible_cpus()?),
-            environments: EnvironmentResolver::new(),
+            tasks: TaskReader::new(),
             skel,
         })
     }
 
-    pub fn collect(&mut self) -> anyhow::Result<Report> {
-        let map = &mut self.skel.maps.process_stats_map;
-        let _ = self.gc.maybe_gc(map);
-        let _ = self.cache.refresh(self.gc.live_pids());
+    pub fn sample(&mut self) -> anyhow::Result<Sample> {
+        let _ = self.gc.maybe_gc(&mut self.skel.maps.process_stats_map);
 
-        // machine_stats_map is a BPF_MAP_TYPE_PERCPU_ARRAY: a plain lookup() fails
-        // on it, so we must use lookup_percpu() and aggregate the per-CPU slots.
-        let machine = match self
+        let link = self
+            .skel
+            .links
+            .task_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow!("task_snapshot is not attached"))?;
+        let tasks = self.tasks.read(link)?;
+
+        let probed = self
+            .batch
+            .lookup(&self.skel.maps.process_stats_map)?
+            .iter()
+            .map(|raw| (raw.global_pid, raw.probed()))
+            .collect();
+
+        let transports = match self
             .skel
             .maps
             .machine_stats_map
             .lookup_percpu(&0u32.to_ne_bytes(), MapFlags::ANY)
         {
-            Ok(Some(per_cpu)) => self.metrics.read_machine_stats(&per_cpu),
-            Ok(None) => {
-                tracing::warn!("machine_stats_map has no entry at key 0");
-                MachineStats::default()
-            }
+            Ok(Some(per_cpu)) => Some(probes::machine_transports(&per_cpu)),
+            Ok(None) => None,
             Err(e) => {
-                tracing::error!("machine_stats_map lookup_percpu failed: {e}");
-                MachineStats::default()
+                tracing::warn!("machine_stats_map lookup_percpu failed: {e}");
+                None
             }
         };
 
-        let batch = self.batch.lookup(&self.skel.maps.process_stats_map)?;
-        let processes = self.metrics.normalize(batch.iter().copied(), &self.cache);
-        let (environments, docker_containers) = self.environments.resolve(&processes);
-        Ok(Report {
-            machine,
-            processes,
-            environments,
-            docker_containers,
+        Ok(Sample {
+            tasks,
+            probed,
+            transports,
         })
-    }
-
-    pub fn name_cache(&self) -> &NameCache {
-        &self.cache
     }
 }
 

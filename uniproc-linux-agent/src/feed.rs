@@ -7,16 +7,17 @@ use uniproc_agent_kit::monitor::{self, Collector, Monitor, Waker, Why};
 use uniproc_agent_kit::{Latest, Notify};
 
 use crate::bpf::BpfAgent;
-use crate::report::Report;
+use crate::model::Snapshot;
+use crate::snapshots::Snapshots;
 
 const IDLE_PERIOD: Duration = Duration::from_secs(1);
 const SPACING: Duration = Duration::from_millis(50);
 
-/// The collector's latest report, a signal for each new one, and the
+/// The collector's latest snapshot, a signal for each new one, and the
 /// intervals watchers want it at.
 #[derive(Clone)]
 pub struct Feed {
-    pub latest: Latest<Report>,
+    pub latest: Latest<Snapshot>,
     pub fresh: Arc<Notify>,
     schedule: Schedule,
 }
@@ -61,19 +62,21 @@ impl Drop for Lease {
 }
 
 struct BpfCollector {
-    agent: BpfAgent<'static>,
-    latest: Latest<Report>,
+    snapshots: Snapshots,
+    latest: Latest<Snapshot>,
     fresh: Arc<Notify>,
     schedule: Schedule,
 }
 
 impl Collector for BpfCollector {
     fn tick(&mut self, _: Why) -> Instant {
-        let collected = self.agent.collect();
-        if let Err(e) = &collected {
-            tracing::warn!("collect failed: {e:#}");
+        match self.snapshots.take() {
+            Ok(snapshot) => self.latest.replace(snapshot),
+            Err(e) => {
+                tracing::warn!("collect failed: {e:#}");
+                self.latest.fail(format!("{e:#}"));
+            }
         }
-        self.latest.publish(collected);
         self.fresh.notify();
         Instant::now() + self.schedule.period()
     }
@@ -85,7 +88,7 @@ pub fn start() -> anyhow::Result<(Monitor, Feed)> {
     let agent = BpfAgent::init(open_object)?;
     let (waker, wakes) = monitor::channel();
     let feed = Feed {
-        latest: Latest::default(),
+        latest: Latest::new(Snapshot::empty()),
         fresh: Arc::new(Notify::new()),
         schedule: Schedule {
             intervals: Arc::default(),
@@ -97,12 +100,15 @@ pub fn start() -> anyhow::Result<(Monitor, Feed)> {
         SPACING,
         wakes,
         BpfCollector {
-            agent,
+            snapshots: Snapshots::new(agent),
             latest: feed.latest.clone(),
             fresh: feed.fresh.clone(),
             schedule: feed.schedule.clone(),
         },
     )?;
+    if let Err(e) = feed.latest.get() {
+        anyhow::bail!("the first snapshot failed: {e}");
+    }
     Ok((monitor, feed))
 }
 
@@ -111,7 +117,7 @@ impl Feed {
     pub fn without_collector() -> Self {
         let (waker, _) = monitor::channel();
         Self {
-            latest: Latest::default(),
+            latest: Latest::new(Snapshot::empty()),
             fresh: Arc::new(Notify::new()),
             schedule: Schedule {
                 intervals: Arc::default(),
@@ -157,5 +163,82 @@ mod tests {
         let _b = feed.lease(Duration::from_millis(300));
         drop(a);
         assert_eq!(feed.schedule.period(), Duration::from_millis(300));
+    }
+
+    #[test]
+    #[ignore = "loads the BPF programs: needs root and a kernel with BTF"]
+    fn the_live_kernel_shows_this_very_process() {
+        let (_monitor, feed) = start().unwrap();
+        let busy = Instant::now();
+        while busy.elapsed() < Duration::from_millis(300) {
+            std::hint::black_box(0u64.wrapping_add(1));
+        }
+        let first = feed.latest.get().unwrap().value;
+        feed.schedule.waker.wake();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let current = feed.latest.get().unwrap().value;
+            if current.number > first.number {
+                break current;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        let pid = std::process::id();
+        let (key, passport) = snapshot
+            .passports
+            .value
+            .iter()
+            .find(|(_, p)| p.view_pid == pid)
+            .expect("this process is in the passports");
+        let row = snapshot.rows.iter().find(|r| r.key == *key).unwrap();
+        let state = &snapshot.states.value[key];
+        eprintln!("{passport:#?}\n{row:#?}\n{state:?}");
+
+        assert!(!passport.cmdline.is_empty());
+        assert!(passport.exe_path.contains("uniproc_linux_agent"));
+        assert_eq!(passport.local_pid, pid);
+        assert_ne!(key.pid, 0);
+        assert!(row.cpu_run_time >= 2_000_000, "{} x100ns", row.cpu_run_time);
+        assert!(row.cpu_user_time + row.cpu_kernel_time > 0);
+        assert!(row.resident_set > 1 << 20);
+        assert!(row.threads >= 2);
+        assert!(row.probed.is_some());
+        assert_eq!(state.nice, 0);
+
+        let machine = &snapshot.machine;
+        eprintln!("{:?}\n{:?}\n{:?}", machine.cpu, machine.memory, machine.load);
+        assert!(machine.cpu.unwrap().count >= 1);
+        assert!(machine.memory.unwrap().total > 0);
+        assert!(machine.transports.is_some());
+        assert!(!snapshot.environments.value.environments.is_empty());
+        eprintln!("{} processes, {} environments", snapshot.rows.len(), snapshot.environments.value.environments.len());
+
+        let collector_ticks = || {
+            std::fs::read_dir("/proc/self/task")
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
+                    (comm.trim() == "collector").then(|| std::fs::read_to_string(e.path().join("stat")).ok())?
+                })
+                .map(|stat| {
+                    let fields: Vec<u64> = stat[stat.rfind(')').unwrap() + 2..]
+                        .split_whitespace()
+                        .map(|f| f.parse().unwrap_or(0))
+                        .collect();
+                    fields[11] + fields[12]
+                })
+                .sum::<u64>()
+        };
+        let before = collector_ticks();
+        let first = feed.latest.get().unwrap().value.number;
+        std::thread::sleep(Duration::from_secs(10));
+        let ticks = feed.latest.get().unwrap().value.number - first;
+        eprintln!(
+            "collector: {} clock ticks over {ticks} snapshots in 10 s",
+            collector_ticks() - before
+        );
     }
 }
