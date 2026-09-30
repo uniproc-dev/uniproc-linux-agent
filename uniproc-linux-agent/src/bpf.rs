@@ -33,6 +33,7 @@ pub struct Sample {
 
 impl<'a> BpfAgent<'a> {
     pub fn init(open_object: &'a mut MaybeUninit<OpenObject>) -> anyhow::Result<Self> {
+        check_kernel()?;
         setup_rlimits()?;
 
         let mut open_skel = ProgSkelBuilder::default().open(open_object)?;
@@ -45,9 +46,6 @@ impl<'a> BpfAgent<'a> {
             .ok_or_else(|| anyhow!("the BPF object has no rodata"))?
             .agent_pid_ns = own_pid_ns;
         let mut skel = open_skel.load()?;
-
-        setup_mem_config(&mut skel)?;
-        setup_kernel_symbols(&mut skel)?;
         skel.attach()?;
 
         let seed_fd = skel.progs.seed_processes.as_fd().as_raw_fd();
@@ -115,61 +113,43 @@ fn setup_rlimits() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn setup_mem_config(skel: &mut prog::ProgSkel) -> anyhow::Result<()> {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
-    let shift = (page_size.trailing_zeros() - 10) as u32;
+/// The oldest kernel whose mm_struct layout the committed vmlinux.h matches.
+const MIN_KERNEL: (u32, u32) = (6, 2);
 
-    skel.maps
-        .shift_map
-        .update(&0u32.to_ne_bytes(), &shift.to_ne_bytes(), MapFlags::ANY)?;
-    skel.maps.last_mem_update_map.update(
-        &0u32.to_ne_bytes(),
-        &1u64.to_ne_bytes(),
-        MapFlags::ANY,
-    )?;
+fn check_kernel() -> anyhow::Result<()> {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+    let version = kernel_version(&release)
+        .ok_or_else(|| anyhow!("cannot read the kernel version from {release:?}"))?;
+    if version < MIN_KERNEL {
+        anyhow::bail!(
+            "kernel {} is too old: the agent needs {}.{} or newer",
+            release.trim(),
+            MIN_KERNEL.0,
+            MIN_KERNEL.1
+        );
+    }
     Ok(())
 }
 
-const KSYM_NAMES: [&str; 4] = [
-    "_totalram_pages",
-    "vm_zone_stat",
-    "vm_node_stat",
-    "totalreserve_pages",
-];
+fn kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.trim().split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
 
-fn setup_kernel_symbols(skel: &mut prog::ProgSkel) -> anyhow::Result<()> {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut addrs = [None; KSYM_NAMES.len()];
-    let mut remaining = KSYM_NAMES.len();
-
-    let file = File::open("/proc/kallsyms")?;
-    for line in BufReader::new(file).lines() {
-        if remaining == 0 {
-            break;
-        }
-        let line = line?;
-        let mut p = line.split_whitespace();
-        let addr = u64::from_str_radix(p.next().unwrap_or("0"), 16).unwrap_or(0);
-        let _ = p.next();
-        let Some(name) = p.next() else { continue };
-
-        if let Some(idx) = KSYM_NAMES.iter().position(|&n| n == name) {
-            if addrs[idx].is_none() {
-                addrs[idx] = Some(addr);
-                remaining -= 1;
-            }
-        }
+    #[test]
+    fn kernel_releases_parse_to_major_and_minor() {
+        assert_eq!(kernel_version("6.18.33.1-microsoft-standard-WSL2\n"), Some((6, 18)));
+        assert_eq!(kernel_version("5.15.167.4-microsoft-standard-WSL2"), Some((5, 15)));
+        assert_eq!(kernel_version("6.2"), Some((6, 2)));
+        assert_eq!(kernel_version("weird"), None);
+        assert!(kernel_version("5.15.1").unwrap() < MIN_KERNEL);
+        assert!(kernel_version("6.10.0").unwrap() >= MIN_KERNEL);
+        assert!(kernel_version(&std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap()).is_some());
     }
-
-    for (i, addr) in addrs.iter().enumerate() {
-        let addr = addr.ok_or_else(|| anyhow!("Symbol {} not found", KSYM_NAMES[i]))?;
-        skel.maps.ksym_addrs_map.update(
-            &(i as u32).to_ne_bytes(),
-            &addr.to_ne_bytes(),
-            MapFlags::ANY,
-        )?;
-    }
-    Ok(())
 }

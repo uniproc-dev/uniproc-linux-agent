@@ -5,15 +5,6 @@ use crate::model::{Probed, Transports};
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct RawMachineStats {
-    pub busy_ns: u64,
-    pub last_tsc: u64,
-
-    pub total_kb: u64,
-    pub free_kb: u64,
-    pub cached_kb: u64,
-    pub available_kb: u64,
-    pub used_kb: u64,
-
     pub vsock_rx_bytes: u64,
     pub vsock_tx_bytes: u64,
     pub p9_rx_bytes: u64,
@@ -44,9 +35,6 @@ pub struct RawProcessStats {
     pub local_pid: u32,
     pub mnt_ns: u64,
     pub pid_ns: u64,
-    pub cpu_runtime_ns: u64,
-    pub rss_kb: u64,
-    pub last_active_ns: u64,
 
     pub vsock_rx_bytes: u64,
     pub vsock_tx_bytes: u64,

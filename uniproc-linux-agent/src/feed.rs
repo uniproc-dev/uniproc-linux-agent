@@ -220,30 +220,32 @@ mod tests {
         assert!(!snapshot.environments.value.environments.is_empty());
         eprintln!("{} processes, {} environments", snapshot.rows.len(), snapshot.environments.value.environments.len());
 
-        let collector_ticks = || {
+        let collector_ticks = || -> std::collections::HashMap<std::ffi::OsString, u64> {
             std::fs::read_dir("/proc/self/task")
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let comm = std::fs::read_to_string(e.path().join("comm")).ok()?;
-                    (comm.trim() == "collector").then(|| std::fs::read_to_string(e.path().join("stat")).ok())?
+                    let stat = std::fs::read_to_string(e.path().join("stat")).ok()?;
+                    (comm.trim() == "collector").then_some((e.file_name(), stat))
                 })
-                .map(|stat| {
+                .map(|(tid, stat)| {
                     let fields: Vec<u64> = stat[stat.rfind(')').unwrap() + 2..]
                         .split_whitespace()
                         .map(|f| f.parse().unwrap_or(0))
                         .collect();
-                    fields[11] + fields[12]
+                    (tid, fields[11] + fields[12])
                 })
-                .sum::<u64>()
+                .collect()
         };
         let before = collector_ticks();
         let first = feed.latest.get().unwrap().value.number;
         std::thread::sleep(Duration::from_secs(10));
         let ticks = feed.latest.get().unwrap().value.number - first;
-        eprintln!(
-            "collector: {} clock ticks over {ticks} snapshots in 10 s",
-            collector_ticks() - before
-        );
+        let spent: u64 = collector_ticks()
+            .iter()
+            .filter_map(|(tid, after)| Some(after - before.get(tid)?))
+            .sum();
+        eprintln!("collector threads: {spent} clock ticks over {ticks} snapshots in 10 s");
     }
 }

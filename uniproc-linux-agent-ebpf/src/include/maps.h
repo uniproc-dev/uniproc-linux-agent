@@ -3,16 +3,6 @@
 #include <bpf/bpf_helpers.h>
 
 struct machine_stats {
-
-    __u64 busy_ns;
-    __u64 last_tsc;
-
-    __u64 total_kb;
-    __u64 free_kb;
-    __u64 cached_kb;
-    __u64 available_kb;
-    __u64 used_kb;
-
     __u64 vsock_rx_bytes;
     __u64 vsock_tx_bytes;
     __u64 p9_rx_bytes;
@@ -42,9 +32,6 @@ struct process_stats {
     __u32 local_pid;
     __u64 mnt_ns;
     __u64 pid_ns;
-    __u64 cpu_runtime_ns;
-    __u64 rss_kb;
-    __u64 last_active_ns;
     __u64 vsock_rx_bytes;
     __u64 vsock_tx_bytes;
     __u64 p9_rx_bytes;
@@ -81,24 +68,3 @@ struct {
     __type(key, __u32);
     __type(value, struct machine_stats);
 } machine_stats_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u64);
-} last_mem_update_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __u32);
-} shift_map SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 4);
-    __type(key, __u32);
-    __type(value, __u64);
-} ksym_addrs_map SEC(".maps");
