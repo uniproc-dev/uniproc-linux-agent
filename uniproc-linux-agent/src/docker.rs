@@ -90,7 +90,7 @@ fn get(socket: &Path, path: &str) -> anyhow::Result<String> {
     let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    write!(stream, "GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n")?;
+    stream.write_all(format!("GET {path} HTTP/1.0\r\nHost: docker\r\n\r\n").as_bytes())?;
 
     let mut response = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -196,9 +196,12 @@ mod tests {
             let mut requests = Vec::new();
             for (expected, answer) in answers {
                 let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0u8; 1024];
-                let read = stream.read(&mut request).unwrap();
-                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let mut request = Vec::new();
+                let mut byte = [0u8];
+                while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
                 assert!(request.contains(expected), "{request}");
                 assert!(request.contains("HTTP/1.0"), "{request}");
                 stream.write_all(answer.as_bytes()).unwrap();
