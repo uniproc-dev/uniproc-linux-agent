@@ -35,8 +35,8 @@ impl IterGc {
     }
 
     pub fn maybe_gc(&mut self, map: &mut MapMut) -> anyhow::Result<()> {
-        self.tick += 1;
-        if self.tick % self.every_n_ticks != 0 {
+        self.tick = self.tick.wrapping_add(1);
+        if !self.tick.is_multiple_of(self.every_n_ticks) {
             return Ok(());
         }
 
@@ -139,8 +139,8 @@ fn fill_iter_pids(iter_prog_fd: RawFd, out: &mut FxHashSet<u32>) -> anyhow::Resu
             break;
         }
 
-        for chunk in buf[..n].chunks_exact(4) {
-            out.insert(u32::from_ne_bytes(chunk.try_into()?));
+        for pid in buf[..n].as_chunks::<4>().0 {
+            out.insert(u32::from_ne_bytes(*pid));
         }
     }
     Ok(())

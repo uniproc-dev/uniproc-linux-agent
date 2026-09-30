@@ -12,7 +12,7 @@ fn main() {
     SkeletonBuilder::new()
         .source(SRC)
         .clang_args(["-I../uniproc-linux-agent-ebpf/src"])
-        .build_and_generate(&out_dir.join("prog.skel.rs"))
+        .build_and_generate(out_dir.join("prog.skel.rs"))
         .unwrap();
 
     watch_dir(BPF_SRC_DIR);
