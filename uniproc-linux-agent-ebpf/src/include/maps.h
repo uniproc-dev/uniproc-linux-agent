@@ -57,7 +57,8 @@ struct process_stats {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
+    __uint(max_entries, 16384);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, __u32);
     __type(value, struct process_stats);
 } process_stats_map SEC(".maps");

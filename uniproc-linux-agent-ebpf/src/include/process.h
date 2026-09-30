@@ -3,12 +3,18 @@
 #include "vmlinux.h"
 #include "maps.h"
 #include "common.h"
+#include "constants.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 
-#define MM_FILEPAGES  0
-#define MM_ANONPAGES  1
-#define MM_SHMEMPAGES 3
+__u64 process_stats_full = 0;
+
+static __always_inline void insert_process_stats(__u32 tgid, struct process_stats *stats,
+                                                 __u64 flags) {
+    long err = bpf_map_update_elem(&process_stats_map, &tgid, stats, flags);
+    if (err && err != -EEXIST)
+        __sync_fetch_and_add(&process_stats_full, 1);
+}
 
 static __always_inline int get_local_tgid(struct task_struct *task, __u32 *out) {
     struct task_struct *leader = BPF_CORE_READ(task, group_leader);

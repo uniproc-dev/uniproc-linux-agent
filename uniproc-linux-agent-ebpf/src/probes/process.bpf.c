@@ -21,7 +21,7 @@ int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
         };
         fill_process_namespaces(task, &new_stats);
 
-        bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_ANY);
+        insert_process_stats(tgid, &new_stats, BPF_ANY);
     }
     return 0;
 }
@@ -57,6 +57,6 @@ int handle_new_task(struct pt_regs *ctx) {
         .local_pid  = local_pid,
     };
     fill_process_namespaces(p, &new_stats);
-    bpf_map_update_elem(&process_stats_map, &tgid, &new_stats, BPF_NOEXIST);
+    insert_process_stats(tgid, &new_stats, BPF_NOEXIST);
     return 0;
 }

@@ -22,6 +22,7 @@ pub struct BpfAgent<'a> {
     gc: IterGc,
     batch: BatchLookup,
     tasks: TaskReader,
+    unprobed: u64,
 }
 
 /// What the kernel side holds at one moment.
@@ -59,12 +60,23 @@ impl<'a> BpfAgent<'a> {
             gc: IterGc::new(10, iter_fd),
             batch: BatchLookup::new(),
             tasks: TaskReader::new(),
+            unprobed: 0,
             skel,
         })
     }
 
     pub fn sample(&mut self) -> anyhow::Result<Sample> {
         let _ = self.gc.maybe_gc(&mut self.skel.maps.process_stats_map);
+
+        if let Some(bss) = self.skel.maps.bss_data.as_deref() {
+            let unprobed = unsafe { std::ptr::read_volatile(&bss.process_stats_full) };
+            if unprobed > self.unprobed {
+                tracing::warn!(
+                    "process_stats_map is full: {unprobed} processes have gone without probes so far"
+                );
+                self.unprobed = unprobed;
+            }
+        }
 
         let link = self
             .skel

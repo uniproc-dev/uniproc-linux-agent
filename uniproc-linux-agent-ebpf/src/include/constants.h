@@ -110,3 +110,6 @@
 #define MM_SWAPENTS   2 /* Anonymous swap entries       */
 #define MM_SHMEMPAGES 3 /* Resident shared memory pages */
 #define NR_MM_COUNTERS 4
+
+// https://github.com/microsoft/WSL2-Linux-Kernel/blob/427645e3db3a8896714f22a3d3fe0c3f7b317ad4/include/uapi/asm-generic/errno-base.h#L21
+#define EEXIST 17 /* File exists */

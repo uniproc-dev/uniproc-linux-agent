@@ -5,6 +5,7 @@ use std::mem::size_of;
 use std::os::fd::AsRawFd;
 
 const BPF_MAP_LOOKUP_BATCH: i64 = 24;
+const CHUNK: usize = 1024;
 
 pub struct BatchLookup {
     keys_buf: Vec<[u8; 4]>,
@@ -15,22 +16,14 @@ pub struct BatchLookup {
 impl BatchLookup {
     pub fn new() -> Self {
         Self {
-            keys_buf: Vec::new(),
-            values_buf: Vec::new(),
+            keys_buf: vec![[0u8; 4]; CHUNK],
+            values_buf: vec![[0u8; size_of::<RawProcessStats>()]; CHUNK],
             out_buf: Vec::new(),
         }
     }
 
     pub fn lookup(&mut self, map: &impl MapCore) -> anyhow::Result<&[RawProcessStats]> {
         let map_fd = map.as_fd().as_raw_fd();
-
-        let cap = (map.max_entries() as usize).next_power_of_two();
-        if self.keys_buf.len() < cap {
-            self.keys_buf.resize(cap, [0u8; 4]);
-            self.values_buf
-                .resize(cap, [0u8; size_of::<RawProcessStats>()]);
-        }
-
         self.out_buf.clear();
 
         #[repr(C, align(8))]
@@ -46,17 +39,14 @@ impl BatchLookup {
             _pad: [u8; 64],
         }
 
-        let mut out_batch = [0u8; 4];
-        let mut in_batch_ptr: u64 = 0;
+        let mut resume_at = [0u8; 4];
+        let mut next = [0u8; 4];
+        let mut first = true;
 
         loop {
-            // NOTE: the kernel writes `count` (and `out_batch`) back into this
-            // struct, so it must be a `mut` binding handed over as a `*mut`
-            // pointer - otherwise reading `attr.count` after the syscall reads
-            // a value the optimiser is entitled to treat as unchanged.
             let mut attr = BatchAttr {
-                in_batch: in_batch_ptr,
-                out_batch: out_batch.as_mut_ptr() as u64,
+                in_batch: if first { 0 } else { resume_at.as_mut_ptr() as u64 },
+                out_batch: next.as_mut_ptr() as u64,
                 keys: self.keys_buf.as_mut_ptr() as u64,
                 values: self.values_buf.as_mut_ptr() as u64,
                 count: self.keys_buf.len() as u32,
@@ -74,6 +64,15 @@ impl BatchLookup {
                     size_of::<BatchAttr>() as u32,
                 )
             };
+            let error = (ret != 0).then(io::Error::last_os_error);
+
+            if error.as_ref().and_then(io::Error::raw_os_error) == Some(libc::ENOSPC) {
+                let grown = self.keys_buf.len() * 2;
+                self.keys_buf.resize(grown, [0u8; 4]);
+                self.values_buf
+                    .resize(grown, [0u8; size_of::<RawProcessStats>()]);
+                continue;
+            }
 
             for value in &self.values_buf[..attr.count as usize] {
                 self.out_buf.push(unsafe {
@@ -81,26 +80,57 @@ impl BatchLookup {
                 });
             }
 
-            if ret == 0 {
-                break;
-            }
-
-            let e = io::Error::last_os_error();
-            match e.raw_os_error() {
-                Some(libc::ENOENT) => break,
-                Some(libc::EFAULT) => {
-                    let new_cap = self.keys_buf.len() * 2;
-                    self.keys_buf.resize(new_cap, [0u8; 4]);
-                    self.values_buf
-                        .resize(new_cap, [0u8; size_of::<RawProcessStats>()]);
-                    in_batch_ptr = 0;
-                    self.out_buf.clear();
-                    continue;
+            match error {
+                None => {
+                    resume_at = next;
+                    first = false;
                 }
-                _ => return Err(e.into()),
+                Some(e) if e.raw_os_error() == Some(libc::ENOENT) => break,
+                Some(e) => return Err(e.into()),
             }
         }
 
         Ok(&self.out_buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libbpf_rs::{MapFlags, MapHandle, MapType, libbpf_sys};
+
+    #[test]
+    #[ignore = "creates a BPF map: needs root"]
+    fn a_map_larger_than_one_chunk_reads_out_whole() {
+        const ENTRIES: u32 = 3 * CHUNK as u32 + 17;
+        let opts = libbpf_sys::bpf_map_create_opts {
+            sz: size_of::<libbpf_sys::bpf_map_create_opts>() as _,
+            map_flags: libbpf_sys::BPF_F_NO_PREALLOC,
+            ..Default::default()
+        };
+        let map = MapHandle::create(
+            MapType::Hash,
+            Some("batch_test"),
+            4,
+            size_of::<RawProcessStats>() as u32,
+            ENTRIES,
+            &opts,
+        )
+        .unwrap();
+        for pid in 1..=ENTRIES {
+            let mut value = [0u8; size_of::<RawProcessStats>()];
+            value[..4].copy_from_slice(&pid.to_ne_bytes());
+            map.update(&pid.to_ne_bytes(), &value, MapFlags::NO_EXIST).unwrap();
+        }
+
+        let mut batch = BatchLookup::new();
+        let mut pids: Vec<u32> = batch
+            .lookup(&map)
+            .unwrap()
+            .iter()
+            .map(|s| s.global_pid)
+            .collect();
+        pids.sort_unstable();
+        assert_eq!(pids, (1..=ENTRIES).collect::<Vec<_>>());
     }
 }
