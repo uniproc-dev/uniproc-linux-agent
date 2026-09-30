@@ -9,9 +9,7 @@ license.workspace = true
 [dependencies]
 rustc-hash = "2.1.1"
 anyhow = { workspace = true, default-features = true }
-env_logger = { workspace = true }
 libc = { workspace = true }
-log = { workspace = true }
 compio = "0.18.0"
 ogurpchik = { git = "https://github.com/uniproc-dev/oguRPChik", tag = "v0.7.1" }
 libbpf-rs = "0.26.0"
