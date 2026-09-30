@@ -75,9 +75,10 @@ impl BatchLookup {
                 )
             };
 
-            for i in 0..attr.count as usize {
-                self.out_buf
-                    .push(unsafe { *(self.values_buf[i].as_ptr() as *const RawProcessStats) });
+            for value in &self.values_buf[..attr.count as usize] {
+                self.out_buf.push(unsafe {
+                    std::ptr::read_unaligned(value.as_ptr() as *const RawProcessStats)
+                });
             }
 
             if ret == 0 {

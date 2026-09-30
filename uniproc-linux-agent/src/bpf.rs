@@ -2,14 +2,14 @@ use crate::batch_lookup::BatchLookup;
 use crate::environment_resolver::read_namespace_inode;
 use crate::iter_gc::IterGc;
 use crate::model::{Probed, Transports};
-use crate::probes;
+use crate::probes::{self, RawMachineStats, RawProcessStats};
 use crate::seed;
 use crate::tasks::{Task, TaskReader};
 use anyhow::anyhow;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject};
 use rustc_hash::FxHashMap;
-use std::mem::MaybeUninit;
+use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsFd, AsRawFd};
 
 mod prog {
@@ -46,6 +46,8 @@ impl<'a> BpfAgent<'a> {
             .ok_or_else(|| anyhow!("the BPF object has no rodata"))?
             .agent_pid_ns = own_pid_ns;
         let mut skel = open_skel.load()?;
+        check_layout(&skel.maps.process_stats_map, size_of::<RawProcessStats>())?;
+        check_layout(&skel.maps.machine_stats_map, size_of::<RawMachineStats>())?;
         skel.attach()?;
 
         let seed_fd = skel.progs.seed_processes.as_fd().as_raw_fd();
@@ -99,6 +101,19 @@ impl<'a> BpfAgent<'a> {
             transports,
         })
     }
+}
+
+fn check_layout(map: &impl MapCore, value_size: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        map.key_size() as usize == size_of::<u32>() && map.value_size() as usize == value_size,
+        "{:?} holds {}-byte keys and {}-byte values, the agent reads {} and {}",
+        map.name(),
+        map.key_size(),
+        map.value_size(),
+        size_of::<u32>(),
+        value_size
+    );
+    Ok(())
 }
 
 fn setup_rlimits() -> anyhow::Result<()> {
