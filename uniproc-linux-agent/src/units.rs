@@ -282,7 +282,10 @@ impl UnitsCollector {
     }
 
     fn disconnect(&mut self) {
-        self.bus.set(None);
+        if let Some(conn) = self.bus.get() {
+            self.bus.set(None);
+            let _ = conn.close();
+        }
         self.listed.clear();
         self.files.clear();
         self.main_pids.clear();
