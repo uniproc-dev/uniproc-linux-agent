@@ -1,4 +1,5 @@
 #include "include/process.h"
+#include <bpf/bpf_tracing.h>
 
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
@@ -38,10 +39,8 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
     return 0;
 }
 
-SEC("kprobe/wake_up_new_task")
-int handle_new_task(struct pt_regs *ctx) {
-    struct task_struct *p = (struct task_struct *)ctx->di;
-
+SEC("fentry/wake_up_new_task")
+int BPF_PROG(handle_new_task, struct task_struct *p) {
     __u32 pid  = BPF_CORE_READ(p, pid);
     __u32 tgid = BPF_CORE_READ(p, tgid);
 

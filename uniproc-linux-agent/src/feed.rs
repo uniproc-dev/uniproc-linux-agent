@@ -214,6 +214,38 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
             assert_eq!(sent, 1 << 20);
         }
+        struct Forked(libc::pid_t, std::path::PathBuf);
+        impl Drop for Forked {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let forked = {
+            let path = std::env::temp_dir().join(format!("uniproc-fork-{}", std::process::id()));
+            let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+            let payload = vec![7u8; 1 << 20];
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe {
+                    let fd = libc::open(c_path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o600);
+                    libc::write(fd, payload.as_ptr().cast(), payload.len());
+                    libc::close(fd);
+                    libc::pause();
+                    libc::_exit(0);
+                }
+            }
+            let forked = Forked(child, path);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while std::fs::metadata(&forked.1).map_or(0, |m| m.len()) < 1 << 20 {
+                assert!(Instant::now() < deadline, "the forked child did not write its file");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            forked
+        };
         let busy = Instant::now();
         while busy.elapsed() < Duration::from_millis(300) {
             std::hint::black_box(0u64.wrapping_add(1));
@@ -247,6 +279,16 @@ mod tests {
             .expect("the scoped sleep is in the passports");
         assert_eq!(contained.container.as_deref(), Some(CONTAINER));
         assert_eq!(passport.container, None);
+        let (forked_key, _) = snapshot
+            .passports
+            .value
+            .iter()
+            .find(|(_, p)| p.view_pid == forked.0 as u32)
+            .expect("the forked child is in the passports");
+        let forked_row = snapshot.rows.iter().find(|r| r.key == *forked_key).unwrap();
+        let forked_probed = forked_row.probed.expect("a child forked without exec is probed");
+        assert!(forked_probed.file_write_bytes >= 1 << 20, "{forked_probed:?}");
+        drop(forked);
         eprintln!("{passport:#?}\n{row:#?}\n{state:?}");
 
         assert!(!passport.cmdline.is_empty());
