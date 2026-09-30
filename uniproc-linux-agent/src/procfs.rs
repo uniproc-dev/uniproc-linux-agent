@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -8,11 +9,49 @@ use crate::model::{
     CpuTimes, MachineCpu, MachineDisk, MachineLoad, MachineMemory, NetworkAdapter,
 };
 
+/// Bytes of one process's command line the agent keeps; the rest is cut.
+pub const CMDLINE_MAX: usize = 16 * 1024;
+/// Bytes of an executable or cgroup path the agent keeps.
+pub const PATH_MAX: usize = 4096;
+
 pub fn cmdline(pid: u32) -> Vec<String> {
-    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+    let mut raw = Vec::new();
+    let read = fs::File::open(format!("/proc/{pid}/cmdline"))
+        .and_then(|file| file.take(CMDLINE_MAX as u64).read_to_end(&mut raw));
+    if read.is_err() {
         return Vec::new();
-    };
-    split_cmdline(&raw)
+    }
+    let args = split_cmdline(&raw);
+    let mut budget = CMDLINE_MAX;
+    fit(&args, &mut budget).into_iter().map(str::to_owned).collect()
+}
+
+/// The leading arguments that fit in `budget` bytes, the last one cut at a
+/// character boundary; what they take comes off the budget.
+pub fn fit<'a>(args: &'a [String], budget: &mut usize) -> Vec<&'a str> {
+    let mut kept = Vec::new();
+    for arg in args {
+        if arg.len() <= *budget {
+            *budget -= arg.len();
+            kept.push(arg.as_str());
+            continue;
+        }
+        let cut = cut_at(arg, *budget);
+        if !cut.is_empty() {
+            kept.push(cut);
+        }
+        *budget = 0;
+        break;
+    }
+    kept
+}
+
+fn cut_at(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn split_cmdline(raw: &[u8]) -> Vec<String> {
@@ -27,13 +66,13 @@ fn split_cmdline(raw: &[u8]) -> Vec<String> {
 
 pub fn exe_path(pid: u32) -> String {
     fs::read_link(format!("/proc/{pid}/exe"))
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| cut_at(&p.to_string_lossy(), PATH_MAX).to_owned())
         .unwrap_or_default()
 }
 
 pub fn cgroup(pid: u32) -> String {
     fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .map(|content| unified_cgroup(&content))
+        .map(|content| cut_at(&unified_cgroup(&content), PATH_MAX).to_owned())
         .unwrap_or_default()
 }
 
@@ -308,6 +347,28 @@ fn parse_loadavg(content: &str) -> Option<MachineLoad> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_past_the_budget_are_cut_at_a_character_boundary() {
+        let args: Vec<String> = vec!["java".into(), "-cp".into(), "ааа".into(), "Main".into()];
+        let mut budget = 10;
+        assert_eq!(fit(&args, &mut budget), ["java", "-cp", "а"]);
+        assert_eq!(budget, 0);
+
+        let mut budget = 100;
+        assert_eq!(fit(&args, &mut budget).len(), 4);
+        assert_eq!(budget, 100 - 4 - 3 - 6 - 4);
+
+        let mut budget = 0;
+        assert!(fit(&args, &mut budget).is_empty());
+    }
+
+    #[test]
+    fn this_process_cmdline_is_read_whole() {
+        let args = cmdline(std::process::id());
+        assert!(!args.is_empty());
+        assert!(args.iter().map(String::len).sum::<usize>() <= CMDLINE_MAX);
+    }
 
     #[test]
     fn a_cmdline_splits_on_nul_and_drops_the_last_one() {

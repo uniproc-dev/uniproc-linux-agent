@@ -6,6 +6,7 @@ use crate::model::{
     CpuTimes, Environments, Key, Machine, Passport, Row, SchedPolicy, Snapshot, State, TaskState,
     Transports,
 };
+use crate::procfs;
 use crate::report::LinuxEnvironmentKind;
 use crate::units::{Unit, UnitStatus};
 
@@ -37,16 +38,21 @@ impl Wanted {
     }
 }
 
-pub fn process_info(p: &Passport, mut out: linux_capnp::process_info::Builder) {
+/// Bytes of command lines one message carries; past them, command lines are cut.
+pub const CMDLINE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// Fills `out` from the passport, taking its command line out of `budget`.
+pub fn process_info(p: &Passport, mut out: linux_capnp::process_info::Builder, budget: &mut usize) {
     out.set_pid(p.key.pid);
     out.set_parent_pid(p.parent_pid);
     out.set_sequence_number(p.key.sequence_number);
     out.set_start_time(p.start_time);
     out.set_name(p.name.as_str());
     out.set_exe_path(p.exe_path.as_str());
-    let mut cmdline = out.reborrow().init_cmdline(p.cmdline.len() as u32);
-    for (i, arg) in p.cmdline.iter().enumerate() {
-        cmdline.set(i as u32, arg.as_str());
+    let args = procfs::fit(&p.cmdline, budget);
+    let mut cmdline = out.reborrow().init_cmdline(args.len() as u32);
+    for (i, arg) in args.into_iter().enumerate() {
+        cmdline.set(i as u32, arg);
     }
     out.set_uid(p.uid);
     out.set_user(p.user.as_str());

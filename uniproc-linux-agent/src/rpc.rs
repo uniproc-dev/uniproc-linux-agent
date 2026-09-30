@@ -117,8 +117,9 @@ impl linux_agent::Server for AgentImpl {
         }
         let passports = &snapshot.passports.value;
         let mut list = out.init_processes(passports.len() as u32);
+        let mut budget = wire::CMDLINE_BUDGET;
         for (i, passport) in passports.values().enumerate() {
-            wire::process_info(passport, list.reborrow().get(i as u32));
+            wire::process_info(passport, list.reborrow().get(i as u32), &mut budget);
         }
         Ok(())
     }
@@ -465,6 +466,7 @@ fn lists(sent: Option<&Sent>, snapshot: &Snapshot, units: &Tagged<Arc<Vec<Unit>>
     out.set_units_etag(units.etag);
 
     let passports = &snapshot.passports.value;
+    let mut budget = wire::CMDLINE_BUDGET;
     match sent.map(|s| &s.passports) {
         Some(base) if base.etag == snapshot.passports.etag => {
             out.reborrow().init_passports().set_unchanged(())
@@ -479,13 +481,13 @@ fn lists(sent: Option<&Sent>, snapshot: &Snapshot, units: &Tagged<Arc<Vec<Unit>>
             }
             let mut list = delta.init_upserted(upserted.len() as u32);
             for (i, passport) in upserted.iter().enumerate() {
-                wire::process_info(passport, list.reborrow().get(i as u32));
+                wire::process_info(passport, list.reborrow().get(i as u32), &mut budget);
             }
         }
         None => {
             let mut list = out.reborrow().init_passports().init_full(passports.len() as u32);
             for (i, passport) in passports.values().enumerate() {
-                wire::process_info(passport, list.reborrow().get(i as u32));
+                wire::process_info(passport, list.reborrow().get(i as u32), &mut budget);
             }
         }
     }
@@ -917,6 +919,33 @@ mod tests {
         let ssh = response.get().unwrap().get_units().unwrap().get(0);
         assert_eq!(ssh.get_active_state().unwrap(), UnitActiveState::Inactive);
         assert_eq!(ssh.get_main_pid(), 0);
+    }
+
+    #[compio::test]
+    async fn long_command_lines_share_one_budget_per_message() {
+        let feed = Feed::without_collector();
+        let arg = "x".repeat(crate::procfs::CMDLINE_MAX);
+        let passports: Passports = (1..=400)
+            .map(|pid| {
+                let mut passport = Passport::clone(&passport(pid));
+                passport.cmdline = vec![arg.clone()];
+                (key(pid), Arc::new(passport))
+            })
+            .collect();
+        let mut snapshot = Snapshot::empty();
+        snapshot.passports.value = Arc::new(passports);
+        feed.latest.replace(snapshot);
+
+        let response = agent(&feed).get_processes_request().send().promise.await.unwrap();
+        let processes = response.get().unwrap().get_processes().unwrap();
+        assert_eq!(processes.len(), 400);
+        let carried: usize = processes
+            .iter()
+            .flat_map(|p| p.get_cmdline().unwrap().iter().map(|a| a.unwrap().len()).collect::<Vec<_>>())
+            .sum();
+        assert_eq!(carried, wire::CMDLINE_BUDGET);
+        assert_eq!(processes.get(0).get_cmdline().unwrap().get(0).unwrap().len(), arg.len());
+        assert_eq!(processes.get(399).get_cmdline().unwrap().len(), 0);
     }
 
     #[compio::test]
