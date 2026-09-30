@@ -1,2 +1,3 @@
-[target."cfg(all())"]
-runner = "sudo -E"
+[alias]
+test-root = ["test", "--config", "target.'cfg(all())'.runner = 'sudo -E'", "--", "--include-ignored", "--test-threads=1"]
+run-root = ["run", "--config", "target.'cfg(all())'.runner = 'sudo -E'"]
