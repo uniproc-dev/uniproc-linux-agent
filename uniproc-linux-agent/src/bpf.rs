@@ -5,7 +5,7 @@ use crate::model::{Probed, Transports};
 use crate::probes::{self, RawMachineStats, RawProcessStats};
 use crate::seed;
 use crate::tasks::{Task, TaskReader};
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, OpenObject};
 use rustc_hash::FxHashMap;
@@ -37,7 +37,9 @@ impl<'a> BpfAgent<'a> {
         check_kernel()?;
         setup_rlimits()?;
 
-        let mut open_skel = ProgSkelBuilder::default().open(open_object)?;
+        let mut open_skel = ProgSkelBuilder::default()
+            .open(open_object)
+            .context("opening the BPF object")?;
         let own_pid_ns = read_namespace_inode(std::process::id(), "pid")
             .ok_or_else(|| anyhow!("cannot read the agent's own pid namespace"))?;
         open_skel
@@ -46,13 +48,13 @@ impl<'a> BpfAgent<'a> {
             .as_deref_mut()
             .ok_or_else(|| anyhow!("the BPF object has no rodata"))?
             .agent_pid_ns = own_pid_ns;
-        let mut skel = open_skel.load()?;
+        let mut skel = open_skel.load().context("loading the BPF programs")?;
         check_layout(&skel.maps.process_stats_map, size_of::<RawProcessStats>())?;
         check_layout(&skel.maps.machine_stats_map, size_of::<RawMachineStats>())?;
-        skel.attach()?;
+        skel.attach().context("attaching the BPF programs")?;
 
         let seed_fd = skel.progs.seed_processes.as_fd().as_raw_fd();
-        seed::seed_existing_processes(seed_fd)?;
+        seed::seed_existing_processes(seed_fd).context("seeding the running processes")?;
 
         let iter_fd = skel.progs.list_processes.as_fd().as_raw_fd();
 
@@ -84,11 +86,12 @@ impl<'a> BpfAgent<'a> {
             .task_snapshot
             .as_ref()
             .ok_or_else(|| anyhow!("task_snapshot is not attached"))?;
-        let tasks = self.tasks.read(link)?;
+        let tasks = self.tasks.read(link).context("reading the task snapshot")?;
 
         let probed = self
             .batch
-            .lookup(&self.skel.maps.process_stats_map)?
+            .lookup(&self.skel.maps.process_stats_map)
+            .context("reading process_stats_map")?
             .iter()
             .map(|raw| (raw.global_pid, raw.probed()))
             .collect();
