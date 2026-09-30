@@ -1,5 +1,5 @@
 //! capnp RPC front-end, mirroring uniproc-windows-agent's src/rpc:
-//! `Endpoint` + `accept_session` + a `linux_agent::Server` impl.
+//! `Endpoint` + `SessionAcceptor` + a `linux_agent::Server` impl.
 //!
 //! One listener: vsock port 5000, which the host (Windows) dials in from
 //! outside the VM. There used to be a second one on a uds socket for in-guest
@@ -19,7 +19,7 @@ use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::Listener;
 use ogurpchik::net::vsock::VsockTarget;
-use ogurpchik::rpc::accept_session;
+use ogurpchik::rpc::SessionAcceptor;
 use uniproc_agent_kit::{Busy, Tagged, Watch};
 use uniproc_protocol::linux_capnp::{agent_listener, linux_agent, lists_update, unit_watcher, watch_handle};
 use uniproc_protocol::meta_capnp::{ResponseStatus, response_meta};
@@ -572,17 +572,15 @@ pub async fn run(feed: Feed, units: Units, secret: Vec<u8>) -> Result<()> {
 
 /// Exit status when the vsock port is already bound.
 pub const EXIT_PORT_TAKEN: i32 = 3;
-/// Exit status when no host session came up in time, or handshakes kept failing.
+/// Exit status when no host session came up in time.
 pub const EXIT_NO_HOST: i32 = 2;
 
 const NO_HOST_FOR: Duration = Duration::from_secs(30);
-const HANDSHAKE_FAILURES: u32 = 5;
 
-/// How many host sessions are live, since when none has been, and how many handshakes failed in a row.
+/// How many host sessions are live, and since when none has been.
 struct Presence {
     live: Cell<usize>,
     idle_since: Cell<Option<Instant>>,
-    failures: Cell<u32>,
 }
 
 impl Presence {
@@ -590,26 +588,18 @@ impl Presence {
         Self {
             live: Cell::new(0),
             idle_since: Cell::new(Some(now)),
-            failures: Cell::new(0),
         }
     }
 
     fn accepted(&self) {
         self.live.set(self.live.get() + 1);
         self.idle_since.set(None);
-        self.failures.set(0);
     }
 
     /// True when it was the last live session.
     fn ended(&self) -> bool {
         self.live.set(self.live.get() - 1);
         self.live.get() == 0
-    }
-
-    /// True once handshakes failed too many times in a row.
-    fn failed(&self) -> bool {
-        self.failures.set(self.failures.get() + 1);
-        self.failures.get() >= HANDSHAKE_FAILURES
     }
 
     fn deserted(&self, now: Instant) -> bool {
@@ -634,30 +624,18 @@ async fn serve_loop(listener: Listener, agent: AgentImpl, handshake: HandshakeMo
         }
     })
     .detach();
+    let protocol = Protocol::new(
+        LINUX_PROTOCOL.id,
+        LINUX_PROTOCOL.major,
+        LINUX_PROTOCOL.minor,
+        LINUX_PROTOCOL.patch,
+    );
+    let mut acceptor = SessionAcceptor::new(&listener, handshake, protocol);
     loop {
-        let session = match accept_session::<linux_agent::Client, _>(
-            &listener,
-            &handshake,
-            Protocol::new(
-                LINUX_PROTOCOL.id,
-                LINUX_PROTOCOL.major,
-                LINUX_PROTOCOL.minor,
-                LINUX_PROTOCOL.patch,
-            ),
-            agent.clone(),
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                tracing::error!("accept_session failed: {e:?}");
-                if presence.failed() {
-                    tracing::error!("{HANDSHAKE_FAILURES} handshakes failed in a row, exiting");
-                    std::process::exit(EXIT_NO_HOST);
-                }
-                continue;
-            }
-        };
+        let session = acceptor
+            .next::<linux_agent::Client, _>(agent.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("the vsock listener failed: {e:?}"))?;
         tracing::info!(peer_version = ?session.peer_version(), "host session accepted");
         presence.accepted();
         let presence = presence.clone();
@@ -1193,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn no_host_for_a_while_or_repeated_failed_handshakes_end_the_agent() {
+    fn no_host_for_a_while_ends_the_agent() {
         let start = Instant::now();
         let presence = Presence::new(start);
         assert!(!presence.deserted(start + NO_HOST_FOR - Duration::from_millis(1)));
@@ -1201,17 +1179,9 @@ mod tests {
 
         let presence = Presence::new(start);
         presence.accepted();
-        assert!(!presence.deserted(start + NO_HOST_FOR * 10));
-        assert!(presence.ended());
-
-        let presence = Presence::new(start);
-        for _ in 1..HANDSHAKE_FAILURES {
-            assert!(!presence.failed());
-        }
         presence.accepted();
-        for _ in 1..HANDSHAKE_FAILURES {
-            assert!(!presence.failed());
-        }
-        assert!(presence.failed());
+        assert!(!presence.deserted(start + NO_HOST_FOR * 10));
+        assert!(!presence.ended());
+        assert!(presence.ended());
     }
 }
