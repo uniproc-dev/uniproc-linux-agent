@@ -2,8 +2,7 @@ use libbpf_rs::{MapCore, MapMut};
 use rustc_hash::FxHashSet;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 const BPF_LINK_CREATE: i64 = 28;
 const BPF_ITER_CREATE: i64 = 33;
@@ -125,12 +124,14 @@ fn sweep(
     *suspects = next;
 }
 
-fn fill_iter_pids(iter_prog_fd: RawFd, out: &mut FxHashSet<u32>) -> anyhow::Result<()> {
-    let link_fd = bpf_link_create(iter_prog_fd)?;
-    let iter_fd = bpf_iter_create(link_fd)?;
-    unsafe { libc::close(link_fd) };
+/// Starts one pass of the task iterator `prog_fd`; the file reads out what it emits.
+pub fn open_iter(prog_fd: RawFd) -> anyhow::Result<File> {
+    let link = bpf_link_create(prog_fd)?;
+    Ok(File::from(bpf_iter_create(link.as_fd())?))
+}
 
-    let mut file = unsafe { File::from_raw_fd(iter_fd) };
+fn fill_iter_pids(iter_prog_fd: RawFd, out: &mut FxHashSet<u32>) -> anyhow::Result<()> {
+    let mut file = open_iter(iter_prog_fd)?;
     let mut buf = [0u8; 4096];
     loop {
         let n = io::Read::read(&mut file, &mut buf)?;
@@ -199,7 +200,7 @@ fn batch_delete(map_fd: RawFd, keys: &[[u8; 4]]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
+fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<OwnedFd> {
     #[repr(C, align(8))]
     struct Attr {
         prog_fd: u32,
@@ -226,7 +227,34 @@ fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
     if ret < 0 {
         Err(io::Error::last_os_error().into())
     } else {
-        Ok(ret as RawFd)
+        Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+    }
+}
+
+fn bpf_iter_create(link: BorrowedFd) -> anyhow::Result<OwnedFd> {
+    #[repr(C, align(8))]
+    struct Attr {
+        link_fd: u32,
+        flags: u32,
+        _pad: [u8; 120],
+    }
+
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            BPF_ITER_CREATE,
+            &Attr {
+                link_fd: link.as_raw_fd() as u32,
+                flags: 0,
+                _pad: [0; 120],
+            } as *const _ as *const libc::c_void,
+            std::mem::size_of::<Attr>() as u32,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error().into())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
     }
 }
 
@@ -254,32 +282,5 @@ mod tests {
 
         sweep([7, 11].into_iter(), &mut suspects, &mut stale);
         assert_eq!(pids(&stale), [7]);
-    }
-}
-
-fn bpf_iter_create(link_fd: RawFd) -> anyhow::Result<RawFd> {
-    #[repr(C, align(8))]
-    struct Attr {
-        link_fd: u32,
-        flags: u32,
-        _pad: [u8; 120],
-    }
-
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            BPF_ITER_CREATE,
-            &Attr {
-                link_fd: link_fd as u32,
-                flags: 0,
-                _pad: [0; 120],
-            } as *const _ as *const libc::c_void,
-            std::mem::size_of::<Attr>() as u32,
-        )
-    };
-    if ret < 0 {
-        Err(io::Error::last_os_error().into())
-    } else {
-        Ok(ret as RawFd)
     }
 }
