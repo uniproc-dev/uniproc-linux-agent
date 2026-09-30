@@ -1,10 +1,9 @@
 // Disk and pipe I/O probes.
 //
 // Hooks:
-//   fexit/vfs_read       — regular files (disk read bytes + IOPS) and FIFOs
-//   fexit/vfs_write      — regular files (disk write bytes + IOPS) and FIFOs
-//   fexit/vfs_iter_read  — splice/sendfile read path for regular files
-//   fexit/vfs_iter_write — splice/sendfile write path for regular files
+//   fexit/vfs_read       — regular files (file read bytes + ops) and FIFOs
+//   fexit/vfs_write      — regular files (file write bytes + ops) and FIFOs
+//   sys_exit_sendfile64  — bytes sendfile(2) moved
 //
 // References:
 //   https://github.com/microsoft/WSL2-Linux-Kernel/.../include/linux/fs.h#L2026
@@ -48,20 +47,9 @@ int BPF_PROG(vfs_write_exit, struct file *file, const char *buf, size_t count,
     return 0;
 }
 
-SEC("fexit/vfs_iter_read")
-int BPF_PROG(vfs_iter_read_exit, struct file *file, struct iov_iter *iter,
-             loff_t *ppos, __u32 flags, ssize_t ret) {
-    if (ret <= 0) return 0;
-    if (is_regular_file(file))
-        update_disk_stats(get_pid(), (__u64)ret, TRAFFIC_RX);
-    return 0;
-}
-
-SEC("fexit/vfs_iter_write")
-int BPF_PROG(vfs_iter_write_exit, struct file *file, struct iov_iter *iter,
-             loff_t *ppos, __u32 flags, ssize_t ret) {
-    if (ret <= 0) return 0;
-    if (is_regular_file(file))
-        update_disk_stats(get_pid(), (__u64)ret, TRAFFIC_TX);
+SEC("tracepoint/syscalls/sys_exit_sendfile64")
+int sendfile_exit(struct trace_event_raw_sys_exit *ctx) {
+    if (ctx->ret <= 0) return 0;
+    add_sendfile_bytes(get_pid(), (__u64)ctx->ret);
     return 0;
 }

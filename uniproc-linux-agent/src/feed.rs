@@ -201,6 +201,18 @@ mod tests {
             stream.read_to_end(&mut received).unwrap();
             sender.join().unwrap();
             assert_eq!(received.len(), 1 << 20);
+
+            use std::os::fd::AsRawFd;
+            let path = std::env::temp_dir().join(format!("uniproc-feed-{}", std::process::id()));
+            std::fs::write(&path, &received).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap().len(), 1 << 20);
+            let file = std::fs::File::open(&path).unwrap();
+            let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
+            let sent = unsafe {
+                libc::sendfile(null.as_raw_fd(), file.as_raw_fd(), std::ptr::null_mut(), 1 << 20)
+            };
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(sent, 1 << 20);
         }
         let busy = Instant::now();
         while busy.elapsed() < Duration::from_millis(300) {
@@ -245,9 +257,14 @@ mod tests {
         assert!(row.cpu_user_time + row.cpu_kernel_time > 0);
         assert!(row.resident_set > 1 << 20);
         assert!(row.threads >= 2);
-        let transports = row.probed.expect("this process is probed").transports;
+        let probed = row.probed.expect("this process is probed");
+        let transports = probed.transports;
         assert!(transports.tcp_loopback_tx >= 1 << 20, "{transports:?}");
         assert!(transports.tcp_loopback_rx >= 1 << 20, "{transports:?}");
+        assert!(probed.file_write_bytes >= 1 << 20, "{probed:?}");
+        assert!(probed.file_read_bytes >= 1 << 20, "{probed:?}");
+        assert!(probed.file_write_ops >= 1 && probed.file_read_ops >= 1, "{probed:?}");
+        assert!(probed.sendfile_bytes >= 1 << 20, "{probed:?}");
         assert_eq!(state.nice, 0);
 
         let machine = &snapshot.machine;

@@ -6,17 +6,17 @@
 #include <bpf/bpf_core_read.h>
 #include "constants.h"
 
-static __always_inline bool is_regular_file(struct file *file_ptr) {
-    if (!file_ptr) return false;
-    struct inode *inode_ptr = BPF_CORE_READ(file_ptr, f_inode);
-    if (!inode_ptr) return false;
-    umode_t mode = BPF_CORE_READ(inode_ptr, i_mode);
-    return (mode & S_IFMT) == S_IFREG;
-}
-
 static __always_inline void increment_disk_iops(__u32 pid, traffic_dir_t dir) {
     struct process_stats *s = bpf_map_lookup_elem(&process_stats_map, &pid);
     if (!s) return;
-    if (dir == TRAFFIC_TX) s->disk_write_iops += 1;
-    else                   s->disk_read_iops  += 1;
+    if (dir == TRAFFIC_TX) __sync_fetch_and_add(&s->disk_write_iops, 1);
+    else                   __sync_fetch_and_add(&s->disk_read_iops,  1);
+}
+
+static __always_inline void add_sendfile_bytes(__u32 pid, __u64 len) {
+    struct process_stats *ps = bpf_map_lookup_elem(&process_stats_map, &pid);
+    if (ps) __sync_fetch_and_add(&ps->sendfile_bytes, len);
+    __u32 zero = 0;
+    struct machine_stats *ms = bpf_map_lookup_elem(&machine_stats_map, &zero);
+    if (ms) ms->sendfile_bytes += len;
 }
