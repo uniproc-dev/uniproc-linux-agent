@@ -188,6 +188,20 @@ mod tests {
         std::fs::write(scope.0.join("cgroup.procs"), scope.1.id().to_string()).unwrap();
 
         let (_monitor, feed) = start().unwrap();
+        {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let sender = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream.write_all(&vec![7u8; 1 << 20]).unwrap();
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).unwrap();
+            sender.join().unwrap();
+            assert_eq!(received.len(), 1 << 20);
+        }
         let busy = Instant::now();
         while busy.elapsed() < Duration::from_millis(300) {
             std::hint::black_box(0u64.wrapping_add(1));
@@ -231,7 +245,9 @@ mod tests {
         assert!(row.cpu_user_time + row.cpu_kernel_time > 0);
         assert!(row.resident_set > 1 << 20);
         assert!(row.threads >= 2);
-        assert!(row.probed.is_some());
+        let transports = row.probed.expect("this process is probed").transports;
+        assert!(transports.tcp_loopback_tx >= 1 << 20, "{transports:?}");
+        assert!(transports.tcp_loopback_rx >= 1 << 20, "{transports:?}");
         assert_eq!(state.nice, 0);
 
         let machine = &snapshot.machine;

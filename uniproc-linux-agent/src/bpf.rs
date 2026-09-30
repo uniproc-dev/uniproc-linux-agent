@@ -113,8 +113,9 @@ fn setup_rlimits() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The oldest kernel whose mm_struct layout the committed vmlinux.h matches.
-const MIN_KERNEL: (u32, u32) = (6, 2);
+/// The oldest kernel with the mm_struct layout of the committed vmlinux.h
+/// (6.2) and the sock_send_length/sock_recv_length tracepoints (6.3).
+const MIN_KERNEL: (u32, u32) = (6, 3);
 
 fn check_kernel() -> anyhow::Result<()> {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;

@@ -1,28 +1,30 @@
 // Socket traffic probes.
 //
 // Hooks:
-//   fexit/sock_sendmsg  — accounts TX bytes for all socket families
-//   fexit/sock_recvmsg  — accounts RX bytes for all socket families
+//   tp_btf/sock_send_length — accounts TX bytes for all socket families
+//   tp_btf/sock_recv_length — accounts RX bytes for all socket families
 //   kretprobe/p9_client_rpc — accounts 9P virtio traffic (WSL2 /mnt)
 //
 // References:
-//   https://github.com/microsoft/WSL2-Linux-Kernel/.../include/linux/net.h#L259
+//   https://github.com/microsoft/WSL2-Linux-Kernel/.../net/socket.c (sock_sendmsg_nosec)
 //   https://github.com/microsoft/WSL2-Linux-Kernel/.../net/9p/client.c#L582
 
 #include "include/socket.h"
 #include <bpf/bpf_tracing.h>
 
-SEC("fexit/sock_sendmsg")
-int BPF_PROG(socket_tracing_enter, struct socket *sock, struct msghdr *msg, int ret) {
-    if (ret <= 0 || !sock) return 0;
-    handle_socket_stats(sock, (__u64)ret, TRAFFIC_TX, get_pid());
+#define MSG_PEEK 2
+
+SEC("tp_btf/sock_send_length")
+int BPF_PROG(socket_send, struct sock *sk, int ret, int flags) {
+    if (ret <= 0 || !sk) return 0;
+    handle_socket_stats(sk, (__u64)ret, TRAFFIC_TX, get_pid());
     return 0;
 }
 
-SEC("fexit/sock_recvmsg")
-int BPF_PROG(socket_tracing_exit, struct socket *sock, struct msghdr *msg, int flags, int ret) {
-    if (ret <= 0 || !sock) return 0;
-    handle_socket_stats(sock, (__u64)ret, TRAFFIC_RX, get_pid());
+SEC("tp_btf/sock_recv_length")
+int BPF_PROG(socket_recv, struct sock *sk, int ret, int flags) {
+    if (ret <= 0 || !sk || (flags & MSG_PEEK)) return 0;
+    handle_socket_stats(sk, (__u64)ret, TRAFFIC_RX, get_pid());
     return 0;
 }
 
