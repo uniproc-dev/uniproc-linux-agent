@@ -18,6 +18,7 @@ pub struct IterGc {
     iter_prog_fd: RawFd,
     stale_buf: Vec<[u8; 4]>,
     live_pids_buf: FxHashSet<u32>,
+    suspects: FxHashSet<u32>,
     stale_ema: f32,
 }
 
@@ -29,6 +30,7 @@ impl IterGc {
             iter_prog_fd,
             stale_buf: Vec::with_capacity(128),
             live_pids_buf: FxHashSet::default(),
+            suspects: FxHashSet::default(),
             stale_ema: 0.0,
         }
     }
@@ -42,15 +44,12 @@ impl IterGc {
         self.live_pids_buf.clear();
         fill_iter_pids(self.iter_prog_fd, &mut self.live_pids_buf)?;
 
-        self.stale_buf.clear();
-        for k in map.keys() {
-            let Ok(arr): Result<[u8; 4], _> = k.try_into() else {
-                continue;
-            };
-            if !self.live_pids_buf.contains(&u32::from_ne_bytes(arr)) {
-                self.stale_buf.push(arr);
-            }
-        }
+        let missing = map.keys().filter_map(|k| {
+            let arr: [u8; 4] = k.try_into().ok()?;
+            let pid = u32::from_ne_bytes(arr);
+            (!self.live_pids_buf.contains(&pid)).then_some(pid)
+        });
+        sweep(missing, &mut self.suspects, &mut self.stale_buf);
 
         let current = self.stale_buf.len() as f32;
         self.stale_ema = (self.stale_ema * (1.0 - EMA_ALPHA) + current * EMA_ALPHA).max(current);
@@ -107,6 +106,23 @@ impl IterGc {
             );
         }
     }
+}
+
+fn sweep(
+    missing: impl Iterator<Item = u32>,
+    suspects: &mut FxHashSet<u32>,
+    stale: &mut Vec<[u8; 4]>,
+) {
+    stale.clear();
+    let mut next = FxHashSet::default();
+    for pid in missing {
+        if suspects.contains(&pid) {
+            stale.push(pid.to_ne_bytes());
+        } else {
+            next.insert(pid);
+        }
+    }
+    *suspects = next;
 }
 
 fn fill_iter_pids(iter_prog_fd: RawFd, out: &mut FxHashSet<u32>) -> anyhow::Result<()> {
@@ -211,6 +227,33 @@ fn bpf_link_create(prog_fd: RawFd) -> anyhow::Result<RawFd> {
         Err(io::Error::last_os_error().into())
     } else {
         Ok(ret as RawFd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pids(stale: &[[u8; 4]]) -> Vec<u32> {
+        stale.iter().map(|k| u32::from_ne_bytes(*k)).collect()
+    }
+
+    #[test]
+    fn a_key_goes_only_after_two_passes_without_its_process() {
+        let mut suspects = FxHashSet::default();
+        let mut stale = Vec::new();
+
+        sweep([7, 9].into_iter(), &mut suspects, &mut stale);
+        assert!(stale.is_empty());
+
+        sweep([9, 11].into_iter(), &mut suspects, &mut stale);
+        assert_eq!(pids(&stale), [9]);
+
+        sweep([7].into_iter(), &mut suspects, &mut stale);
+        assert!(stale.is_empty(), "7 came back in between, so its count starts over");
+
+        sweep([7, 11].into_iter(), &mut suspects, &mut stale);
+        assert_eq!(pids(&stale), [7]);
     }
 }
 
