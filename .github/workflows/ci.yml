@@ -6,56 +6,34 @@ on:
   pull_request:
     branches: [main]
 
-# Cancels a stale run when new commits land on the same branch/PR - avoids
-# burning CI minutes on a build for a diff that's already been superseded.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
-    # Linux-only by construction: the agent is an eBPF program plus a loader.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      # The eBPF side is C compiled by clang through libbpf-cargo, so the
-      # runner needs a clang that can target bpf, plus libbpf headers for
-      # bpf_helpers.h and friends. `capnproto` is for uniproc-protocol's
-      # build.rs, which shells out to the `capnp` binary.
-      #
-      # Versions are deliberately left to the runner image here: unlike the
-      # Windows jobs, apt on a pinned ubuntu-latest image already gives a
-      # stable set, and pinning exact patch versions would break the moment
-      # GitHub rolls the image.
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev capnproto
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev capnproto
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
 
-      # vmlinux.h is committed rather than generated from the runner's
-      # /sys/kernel/btf/vmlinux on purpose - see the note in .gitignore.
-      # Generating it here would bake in the runner's kernel layout, which is
-      # exactly what CO-RE exists to avoid.
-      - name: Build
-        run: cargo build --workspace --all-targets
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 
-      # Anything that needs a live BPF program loaded (which needs
-      # CAP_BPF and a kernel with BTF) cannot run on a hosted runner and is
-      # marked #[ignore]; this only covers the pure-userspace tests.
-      #
-      # .cargo/config.toml sets `runner = "sudo -E"` so that locally run
-      # tests get the capabilities the agent needs. That breaks here: sudo
-      # strips LD_* from the environment even with -E, and the proc-macro
-      # crate's test binary links libstd dynamically, so it dies with
-      # "libstd-*.so: cannot open shared object file". Nothing that runs on
-      # this job needs privileges, so override the runner with `env`, which
-      # execs the binary unchanged.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
       - name: Test
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: env
-        run: cargo test --workspace
+        run: cargo test --locked
+
+      - name: Test against the runner's kernel
+        run: cargo test-root
