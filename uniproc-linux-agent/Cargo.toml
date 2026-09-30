@@ -26,7 +26,7 @@ futures = "0.3.32"
 zbus = { version = "5.19.0", default-features = false, features = ["blocking-api", "async-io"] }
 
 [build-dependencies]
-libbpf-cargo = "0.26.0"
+libbpf-cargo = "0.27.2"
 
 [[bin]]
 name = "uniproc-linux-agent"

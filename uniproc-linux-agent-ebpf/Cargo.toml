@@ -7,7 +7,7 @@ license.workspace = true
 publish = false
 
 [build-dependencies]
-libbpf-cargo = "0.26.0"
+libbpf-cargo = "0.27.2"
 
 [profile.dev]
 debug = true
