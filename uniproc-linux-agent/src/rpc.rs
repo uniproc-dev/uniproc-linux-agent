@@ -539,6 +539,139 @@ fn uncacheable(mut meta: response_meta::Builder) {
     meta.set_status(ResponseStatus::Ok);
 }
 
+pub async fn run(feed: Feed, units: Units, secret: Vec<u8>) -> Result<()> {
+    // vsock carries no peer identity across the VM boundary - `getpeername`
+    // yields a CID, and a PID from another kernel would be meaningless - so
+    // `HandshakeMode::signed_process` cannot work here at all; it refuses this
+    // transport outright. A shared secret handed over at launch is what proves
+    // the host is the process that started us.
+    let handshake = HandshakeMode::hmac(secret);
+
+    // On Linux the listen-side target is ignored (binds VMADDR_CID_ANY).
+    let vsock = Endpoint::Vsock {
+        target: VsockTarget::Cid(0),
+        port: WSL_AGENT_VSOCK_PORT,
+    };
+
+    // Failing to bind most likely means something else already holds the port -
+    // worth being loud about, since that is exactly what an impostor would do.
+    let vsock_listener = match vsock.listen().await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("failed to bind vsock port {WSL_AGENT_VSOCK_PORT}: {e:?}");
+            std::process::exit(EXIT_PORT_TAKEN);
+        }
+    };
+
+    tracing::info!(%vsock, "listening");
+
+    serve_loop(vsock_listener, AgentImpl { feed, units }, handshake).await
+}
+
+/// Exit status when the vsock port is already bound.
+pub const EXIT_PORT_TAKEN: i32 = 3;
+/// Exit status when no host session came up in time, or handshakes kept failing.
+pub const EXIT_NO_HOST: i32 = 2;
+
+const NO_HOST_FOR: Duration = Duration::from_secs(30);
+const HANDSHAKE_FAILURES: u32 = 5;
+
+/// How many host sessions are live, since when none has been, and how many handshakes failed in a row.
+struct Presence {
+    live: Cell<usize>,
+    idle_since: Cell<Option<Instant>>,
+    failures: Cell<u32>,
+}
+
+impl Presence {
+    fn new(now: Instant) -> Self {
+        Self {
+            live: Cell::new(0),
+            idle_since: Cell::new(Some(now)),
+            failures: Cell::new(0),
+        }
+    }
+
+    fn accepted(&self) {
+        self.live.set(self.live.get() + 1);
+        self.idle_since.set(None);
+        self.failures.set(0);
+    }
+
+    /// True when it was the last live session.
+    fn ended(&self) -> bool {
+        self.live.set(self.live.get() - 1);
+        self.live.get() == 0
+    }
+
+    /// True once handshakes failed too many times in a row.
+    fn failed(&self) -> bool {
+        self.failures.set(self.failures.get() + 1);
+        self.failures.get() >= HANDSHAKE_FAILURES
+    }
+
+    fn deserted(&self, now: Instant) -> bool {
+        self.idle_since
+            .get()
+            .is_some_and(|since| now.duration_since(since) >= NO_HOST_FOR)
+    }
+}
+
+async fn serve_loop(listener: Listener, agent: AgentImpl, handshake: HandshakeMode) -> Result<()> {
+    let presence = Rc::new(Presence::new(Instant::now()));
+    compio::runtime::spawn({
+        let presence = presence.clone();
+        async move {
+            loop {
+                compio::time::sleep(Duration::from_secs(1)).await;
+                if presence.deserted(Instant::now()) {
+                    tracing::error!("no host session for {NO_HOST_FOR:?}, exiting");
+                    std::process::exit(EXIT_NO_HOST);
+                }
+            }
+        }
+    })
+    .detach();
+    loop {
+        let session = match accept_session::<linux_agent::Client, _>(
+            &listener,
+            &handshake,
+            Protocol::new(
+                LINUX_PROTOCOL.id,
+                LINUX_PROTOCOL.major,
+                LINUX_PROTOCOL.minor,
+                LINUX_PROTOCOL.patch,
+            ),
+            agent.clone(),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                tracing::error!("accept_session failed: {e:?}");
+                if presence.failed() {
+                    tracing::error!("{HANDSHAKE_FAILURES} handshakes failed in a row, exiting");
+                    std::process::exit(EXIT_NO_HOST);
+                }
+                continue;
+            }
+        };
+        tracing::info!(peer_version = ?session.peer_version(), "host session accepted");
+        presence.accepted();
+        let presence = presence.clone();
+        compio::runtime::spawn(async move {
+            if let Err(e) = session.wait().await {
+                tracing::warn!("rpc session ended: {e:?}");
+            }
+            if presence.ended() {
+                tracing::info!("last host session ended, exiting");
+                std::process::exit(0);
+            }
+        })
+        .detach();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1028,68 +1161,27 @@ mod tests {
         assert_eq!(watch_interval(500), Duration::from_millis(500));
         assert_eq!(watch_interval(u32::MAX), Duration::from_secs(60));
     }
-}
 
-pub async fn run(feed: Feed, units: Units, secret: Vec<u8>) -> Result<()> {
-    // vsock carries no peer identity across the VM boundary - `getpeername`
-    // yields a CID, and a PID from another kernel would be meaningless - so
-    // `HandshakeMode::signed_process` cannot work here at all; it refuses this
-    // transport outright. A shared secret handed over at launch is what proves
-    // the host is the process that started us.
-    let handshake = HandshakeMode::hmac(secret);
+    #[test]
+    fn no_host_for_a_while_or_repeated_failed_handshakes_end_the_agent() {
+        let start = Instant::now();
+        let presence = Presence::new(start);
+        assert!(!presence.deserted(start + NO_HOST_FOR - Duration::from_millis(1)));
+        assert!(presence.deserted(start + NO_HOST_FOR));
 
-    // On Linux the listen-side target is ignored (binds VMADDR_CID_ANY).
-    let vsock = Endpoint::Vsock {
-        target: VsockTarget::Cid(0),
-        port: WSL_AGENT_VSOCK_PORT,
-    };
+        let presence = Presence::new(start);
+        presence.accepted();
+        assert!(!presence.deserted(start + NO_HOST_FOR * 10));
+        assert!(presence.ended());
 
-    // Failing to bind most likely means something else already holds the port -
-    // worth being loud about, since that is exactly what an impostor would do.
-    let vsock_listener = vsock.listen().await.map_err(|e| {
-        anyhow::anyhow!("failed to bind vsock port {WSL_AGENT_VSOCK_PORT}: {e:?}")
-    })?;
-
-    tracing::info!(%vsock, "listening");
-
-    serve_loop(vsock_listener, AgentImpl { feed, units }, handshake).await
-}
-
-async fn serve_loop(listener: Listener, agent: AgentImpl, handshake: HandshakeMode) -> Result<()> {
-    let live = Rc::new(Cell::new(0usize));
-    loop {
-        let session = match accept_session::<linux_agent::Client, _>(
-            &listener,
-            &handshake,
-            Protocol::new(
-                LINUX_PROTOCOL.id,
-                LINUX_PROTOCOL.major,
-                LINUX_PROTOCOL.minor,
-                LINUX_PROTOCOL.patch,
-            ),
-            agent.clone(),
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                tracing::error!("accept_session failed: {e:?}");
-                continue;
-            }
-        };
-        tracing::info!(peer_version = ?session.peer_version(), "host session accepted");
-        live.set(live.get() + 1);
-        let live = live.clone();
-        compio::runtime::spawn(async move {
-            if let Err(e) = session.wait().await {
-                tracing::warn!("rpc session ended: {e:?}");
-            }
-            live.set(live.get() - 1);
-            if live.get() == 0 {
-                tracing::info!("last host session ended, exiting");
-                std::process::exit(0);
-            }
-        })
-        .detach();
+        let presence = Presence::new(start);
+        for _ in 1..HANDSHAKE_FAILURES {
+            assert!(!presence.failed());
+        }
+        presence.accepted();
+        for _ in 1..HANDSHAKE_FAILURES {
+            assert!(!presence.failed());
+        }
+        assert!(presence.failed());
     }
 }
