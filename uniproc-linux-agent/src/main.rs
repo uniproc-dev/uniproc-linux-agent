@@ -3,6 +3,7 @@ use tracing_subscriber::filter::LevelFilter;
 mod batch_lookup;
 mod bpf;
 mod commands;
+mod docker;
 mod environment_resolver;
 mod feed;
 mod iter_gc;

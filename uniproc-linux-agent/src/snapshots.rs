@@ -6,6 +6,7 @@ use rustc_hash::FxHashMap;
 use uniproc_agent_kit::{Epoch, Versioned};
 
 use crate::bpf::{BpfAgent, Sample};
+use crate::docker;
 use crate::environment_resolver::EnvironmentResolver;
 use crate::model::{
     Environments, Key, Machine, Passport, Passports, Row, SchedPolicy, Snapshot, State, States,
@@ -113,6 +114,7 @@ impl Snapshots {
             mnt_ns: p.mnt_ns,
             pid_ns: p.pid_ns,
             cgroup: if visible { procfs::cgroup(p.view_pid) } else { String::new() },
+            container: docker::container_id(&p.cgroup_leaf()).map(str::to_owned),
         });
         self.known.insert(key, (p.exec_id, passport.clone()));
         passport

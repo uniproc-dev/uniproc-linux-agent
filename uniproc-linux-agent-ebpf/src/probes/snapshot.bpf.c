@@ -3,6 +3,13 @@
 
 const volatile __u64 agent_pid_ns = 0;
 
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct process_record);
+} snapshot_scratch SEC(".maps");
+
 static __always_inline __u32 pid_in_agent_ns(struct task_struct *task) {
     struct pid *pid_ptr = BPF_CORE_READ(task, thread_pid);
     unsigned int level = BPF_CORE_READ(pid_ptr, level);
@@ -68,39 +75,44 @@ int task_snapshot(struct bpf_iter__task *ctx) {
 
     __u32 tgid = BPF_CORE_READ(task, tgid);
 
-    if (task == leader) {
-        struct process_record p = {};
-        p.kind = RECORD_PROCESS;
-        p.tgid = tgid;
-        p.ppid = BPF_CORE_READ(task, real_parent, tgid);
-        get_local_tgid(task, &p.local_pid);
-        p.view_pid = pid_in_agent_ns(task);
-        p.start_boottime = BPF_CORE_READ(task, start_boottime);
-        p.exec_id = BPF_CORE_READ(task, self_exec_id);
-        get_mnt_ns_id(task, &p.mnt_ns);
-        get_pid_ns_id(task, &p.pid_ns);
+    __u32 zero = 0;
+    struct process_record *p = bpf_map_lookup_elem(&snapshot_scratch, &zero);
+    if (task == leader && p) {
+        __builtin_memset(p, 0, sizeof(*p));
+        p->kind = RECORD_PROCESS;
+        p->tgid = tgid;
+        p->ppid = BPF_CORE_READ(task, real_parent, tgid);
+        get_local_tgid(task, &p->local_pid);
+        p->view_pid = pid_in_agent_ns(task);
+        p->start_boottime = BPF_CORE_READ(task, start_boottime);
+        p->exec_id = BPF_CORE_READ(task, self_exec_id);
+        get_mnt_ns_id(task, &p->mnt_ns);
+        get_pid_ns_id(task, &p->pid_ns);
 
         struct signal_struct *sig = BPF_CORE_READ(task, signal);
-        read_exited(sig, &p.exited);
-        p.threads = BPF_CORE_READ(sig, nr_threads);
+        read_exited(sig, &p->exited);
+        p->threads = BPF_CORE_READ(sig, nr_threads);
 
-        p.rss_file    = rss_pages(mm, MM_FILEPAGES);
-        p.rss_anon    = rss_pages(mm, MM_ANONPAGES);
-        p.rss_shmem   = rss_pages(mm, MM_SHMEMPAGES);
-        p.swap        = rss_pages(mm, MM_SWAPENTS);
-        p.hiwater_rss = BPF_CORE_READ(mm, hiwater_rss);
-        p.total_vm    = BPF_CORE_READ(mm, total_vm);
-        p.hiwater_vm  = BPF_CORE_READ(mm, hiwater_vm);
+        p->rss_file    = rss_pages(mm, MM_FILEPAGES);
+        p->rss_anon    = rss_pages(mm, MM_ANONPAGES);
+        p->rss_shmem   = rss_pages(mm, MM_SHMEMPAGES);
+        p->swap        = rss_pages(mm, MM_SWAPENTS);
+        p->hiwater_rss = BPF_CORE_READ(mm, hiwater_rss);
+        p->total_vm    = BPF_CORE_READ(mm, total_vm);
+        p->hiwater_vm  = BPF_CORE_READ(mm, hiwater_vm);
 
-        p.state       = BPF_CORE_READ(task, __state);
-        p.exit_state  = BPF_CORE_READ(task, exit_state);
-        p.static_prio = BPF_CORE_READ(task, static_prio);
-        p.policy      = BPF_CORE_READ(task, policy);
-        p.rt_priority = BPF_CORE_READ(task, rt_priority);
-        p.uid         = BPF_CORE_READ(task, real_cred, uid.val);
-        BPF_CORE_READ_STR_INTO(&p.comm, task, comm);
+        p->state       = BPF_CORE_READ(task, __state);
+        p->exit_state  = BPF_CORE_READ(task, exit_state);
+        p->static_prio = BPF_CORE_READ(task, static_prio);
+        p->policy      = BPF_CORE_READ(task, policy);
+        p->rt_priority = BPF_CORE_READ(task, rt_priority);
+        p->uid         = BPF_CORE_READ(task, real_cred, uid.val);
+        BPF_CORE_READ_STR_INTO(&p->comm, task, comm);
+        const char *cgroup = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, name);
+        if (cgroup)
+            bpf_probe_read_kernel_str(p->cgroup, sizeof(p->cgroup), cgroup);
 
-        bpf_seq_write(seq, &p, sizeof(p));
+        bpf_seq_write(seq, p, sizeof(*p));
     }
 
     struct thread_record t = {};

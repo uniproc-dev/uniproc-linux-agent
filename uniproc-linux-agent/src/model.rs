@@ -28,6 +28,8 @@ pub struct Passport {
     pub mnt_ns: u64,
     pub pid_ns: u64,
     pub cgroup: String,
+    /// The docker container id in the process's cgroup name, for every process in the VM.
+    pub container: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

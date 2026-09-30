@@ -1,14 +1,10 @@
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 
 use rustc_hash::FxHashMap;
-use serde_json::Value;
+
+use crate::docker::{self, Container, Docker};
 use crate::model::Passport;
 use crate::report::{LinuxDockerContainerInfo, LinuxEnvironmentInfo, LinuxEnvironmentKind};
-
-const DOCKER_API_VERSION: &str = "v1.41";
-const DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 
 #[derive(Clone, Copy)]
 struct NamespaceRep {
@@ -27,6 +23,7 @@ pub struct EnvironmentResolver {
     /// the target, which an unprivileged agent does not have for anything it
     /// does not own.
     distro_name: Option<String>,
+    docker: Docker,
 }
 
 impl EnvironmentResolver {
@@ -34,6 +31,7 @@ impl EnvironmentResolver {
         Self {
             own_pid_ns: read_namespace_inode(std::process::id(), "pid"),
             distro_name: read_local_distro_name(),
+            docker: Docker::start(),
         }
     }
 
@@ -64,7 +62,7 @@ impl EnvironmentResolver {
                 });
         }
 
-        let docker = resolve_docker_containers(&namespaces).unwrap_or_default();
+        let docker = containers_of(&self.docker.containers(), processes.clone());
         let docker_by_ns: FxHashMap<u64, &LinuxDockerContainerInfo> =
             docker.iter().map(|info| (info.mnt_ns, info)).collect();
 
@@ -110,88 +108,43 @@ impl EnvironmentResolver {
     }
 }
 
-fn resolve_docker_containers(
-    namespaces: &FxHashMap<u64, NamespaceRep>,
-) -> anyhow::Result<Vec<LinuxDockerContainerInfo>> {
-    if namespaces.is_empty() {
-        return Ok(Vec::new());
+/// The running containers some process is in, with the namespaces of the
+/// container's init, or of its first process when init is not in sight.
+/// Processes name their container through their cgroup, which the kernel
+/// reports for every process in the VM; the daemon's `State.Pid` would be a
+/// pid in the daemon's own namespace, another distro's under Docker Desktop.
+fn containers_of<'p>(
+    containers: &[Container],
+    processes: impl Iterator<Item = &'p Passport>,
+) -> Vec<LinuxDockerContainerInfo> {
+    let running: FxHashMap<&str, &Container> =
+        containers.iter().map(|c| (c.id.as_str(), c)).collect();
+    let mut found: FxHashMap<&str, (&Container, &Passport)> = FxHashMap::default();
+    for process in processes {
+        let Some(container) = process.container.as_deref().and_then(|id| running.get(id)) else {
+            continue;
+        };
+        found
+            .entry(container.id.as_str())
+            .and_modify(|(_, seen)| {
+                if process.local_pid == 1 {
+                    *seen = process;
+                }
+            })
+            .or_insert((container, process));
     }
-
-    let raw_list = docker_get(&format!("/{DOCKER_API_VERSION}/containers/json?all=1"))?;
-    let list: Value = serde_json::from_str(&raw_list)?;
-
-    let mut out = Vec::new();
-    let Some(containers) = list.as_array() else {
-        return Ok(out);
-    };
-
-    for container in containers {
-        let Some(id) = container.get("Id").and_then(Value::as_str) else {
-            continue;
-        };
-
-        let raw_json = match docker_get(&format!("/{DOCKER_API_VERSION}/containers/{id}/json")) {
-            Ok(raw_json) => raw_json,
-            Err(_) => continue,
-        };
-
-        let inspect: Value = match serde_json::from_str(&raw_json) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let pid = inspect
-            .get("State")
-            .and_then(|state| state.get("Pid"))
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as u32;
-        if pid == 0 {
-            continue;
-        }
-
-        let Some(mnt_ns) = read_namespace_inode(pid, "mnt") else {
-            continue;
-        };
-        if !namespaces.contains_key(&mnt_ns) {
-            continue;
-        }
-
-        let pid_ns = read_namespace_inode(pid, "pid").unwrap_or_default();
-        out.push(LinuxDockerContainerInfo {
-            id: id.to_string(),
-            mnt_ns,
-            pid_ns,
-            api_version: DOCKER_API_VERSION.to_string(),
-            raw_json,
-        });
-    }
-
+    let mut out: Vec<LinuxDockerContainerInfo> = found
+        .into_values()
+        .map(|(container, process)| LinuxDockerContainerInfo {
+            id: container.id.clone(),
+            mnt_ns: process.mnt_ns,
+            pid_ns: process.pid_ns,
+            api_version: docker::API_VERSION.to_string(),
+            raw_json: container.raw_json.clone(),
+        })
+        .collect();
     out.sort_by(|left, right| left.mnt_ns.cmp(&right.mnt_ns).then(left.id.cmp(&right.id)));
-    Ok(out)
-}
-
-fn docker_get(path: &str) -> anyhow::Result<String> {
-    let mut stream = UnixStream::connect(DOCKER_SOCKET_PATH)?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
-    )?;
-    stream.shutdown(std::net::Shutdown::Write)?;
-
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-
-    let Some(split_at) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
-        anyhow::bail!("invalid docker response");
-    };
-
-    let (head, body) = response.split_at(split_at + 4);
-    let head = std::str::from_utf8(head)?;
-    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
-        anyhow::bail!("docker api error: {}", head.lines().next().unwrap_or("?"));
-    }
-
-    Ok(String::from_utf8(body.to_vec())?)
+    out
 }
 
 /// The distro we are running in, read straight off our own filesystem.
@@ -231,4 +184,52 @@ pub fn read_namespace_inode(pid: u32, namespace: &str) -> Option<u64> {
     let start = target.find('[')? + 1;
     let end = target[start..].find(']')? + start;
     target[start..end].parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Key;
+
+    const ID: &str = "4f1c0d2a9b8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a";
+
+    fn process(pid: u32, local_pid: u32, mnt_ns: u64, pid_ns: u64, container: Option<&str>) -> Passport {
+        Passport {
+            key: Key {
+                pid,
+                sequence_number: pid as u64,
+            },
+            view_pid: 0,
+            parent_pid: 1,
+            start_time: 0,
+            name: String::new(),
+            exe_path: String::new(),
+            cmdline: Vec::new(),
+            uid: 0,
+            user: String::new(),
+            local_pid,
+            mnt_ns,
+            pid_ns,
+            cgroup: String::new(),
+            container: container.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_container_takes_the_namespaces_of_its_init_and_only_running_ones_count() {
+        let containers = vec![Container {
+            id: ID.into(),
+            raw_json: "{}".into(),
+        }];
+        let processes = [
+            process(10, 7, 900, 901, Some(ID)),
+            process(11, 1, 800, 801, Some(ID)),
+            process(12, 1, 700, 701, Some(&ID.replace('4', "5"))),
+            process(13, 50, 100, 101, None),
+        ];
+        let found = containers_of(&containers, processes.iter());
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].mnt_ns, found[0].pid_ns), (800, 801));
+        assert_eq!(found[0].raw_json, "{}");
+    }
 }

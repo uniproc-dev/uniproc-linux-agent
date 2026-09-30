@@ -173,6 +173,20 @@ mod tests {
     #[test]
     #[ignore = "loads the BPF programs: needs root and a kernel with BTF"]
     fn the_live_kernel_shows_this_very_process() {
+        const CONTAINER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        struct Scope(std::path::PathBuf, std::process::Child);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                let _ = self.1.kill();
+                let _ = self.1.wait();
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let dir = std::path::PathBuf::from(format!("/sys/fs/cgroup/docker-{CONTAINER}.scope"));
+        std::fs::create_dir(&dir).unwrap();
+        let scope = Scope(dir, std::process::Command::new("sleep").arg("30").spawn().unwrap());
+        std::fs::write(scope.0.join("cgroup.procs"), scope.1.id().to_string()).unwrap();
+
         let (_monitor, feed) = start().unwrap();
         let busy = Instant::now();
         while busy.elapsed() < Duration::from_millis(300) {
@@ -199,6 +213,14 @@ mod tests {
             .expect("this process is in the passports");
         let row = snapshot.rows.iter().find(|r| r.key == *key).unwrap();
         let state = &snapshot.states.value[key];
+        let contained = snapshot
+            .passports
+            .value
+            .values()
+            .find(|p| p.view_pid == scope.1.id())
+            .expect("the scoped sleep is in the passports");
+        assert_eq!(contained.container.as_deref(), Some(CONTAINER));
+        assert_eq!(passport.container, None);
         eprintln!("{passport:#?}\n{row:#?}\n{state:?}");
 
         assert!(!passport.cmdline.is_empty());

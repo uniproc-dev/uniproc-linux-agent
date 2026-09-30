@@ -79,13 +79,23 @@ pub struct ProcessRecord {
     pub uid: u32,
     pub view_pid: u32,
     pub comm: [u8; 16],
+    pub cgroup: [u8; 128],
 }
 
 impl ProcessRecord {
     pub fn comm(&self) -> String {
-        let end = self.comm.iter().position(|&b| b == 0).unwrap_or(self.comm.len());
-        String::from_utf8_lossy(&self.comm[..end]).into_owned()
+        c_string(&self.comm)
     }
+
+    /// The last component of the process's cgroup v2 path, cut at 127 bytes.
+    pub fn cgroup_leaf(&self) -> String {
+        c_string(&self.cgroup)
+    }
+}
+
+fn c_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// A process as the kernel holds it, its counters summed over live and exited threads.
@@ -202,6 +212,7 @@ mod tests {
             uid: 0,
             view_pid: tgid,
             comm: *b"bash\0\0\0\0\0\0\0\0\0\0\0\0",
+            cgroup: [0; 128],
         }
     }
 
@@ -249,6 +260,6 @@ mod tests {
     #[test]
     fn the_records_match_the_c_layout() {
         assert_eq!(size_of::<ThreadRecord>(), 8 + 13 * 8);
-        assert_eq!(size_of::<ProcessRecord>(), 16 + 4 * 8 + 13 * 8 + 7 * 8 + 8 * 4 + 16);
+        assert_eq!(size_of::<ProcessRecord>(), 16 + 4 * 8 + 13 * 8 + 7 * 8 + 8 * 4 + 16 + 128);
     }
 }

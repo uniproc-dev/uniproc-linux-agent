@@ -57,4 +57,5 @@ struct process_record {
     __u32 uid;
     __u32 view_pid;
     char comm[16];
+    char cgroup[128];
 };

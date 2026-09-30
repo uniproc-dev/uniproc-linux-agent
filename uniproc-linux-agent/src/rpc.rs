@@ -713,6 +713,7 @@ mod tests {
             mnt_ns: 1,
             pid_ns: 2,
             cgroup: "/".into(),
+            container: None,
         })
     }
 
