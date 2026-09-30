@@ -25,8 +25,8 @@ typedef enum { TRAFFIC_TX, TRAFFIC_RX } traffic_dir_t;
 static __always_inline void fn_name(__u32 pid, __u64 len, traffic_dir_t dir) {      \
 struct process_stats *ps = bpf_map_lookup_elem(&process_stats_map, &pid);       \
 if (ps) {                                                                        \
-if (dir == TRAFFIC_TX) ps->tx_field += len;                                 \
-else                   ps->rx_field += len;                                 \
+if (dir == TRAFFIC_TX) __sync_fetch_and_add(&ps->tx_field, len);            \
+else                   __sync_fetch_and_add(&ps->rx_field, len);            \
 }                                                                                \
 __u32 _zero = 0;                                                                 \
 struct machine_stats *ms = bpf_map_lookup_elem(&machine_stats_map, &_zero);     \
