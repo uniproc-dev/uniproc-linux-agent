@@ -48,6 +48,10 @@ impl<'a> BpfAgent<'a> {
             .as_deref_mut()
             .ok_or_else(|| anyhow!("the BPF object has no rodata"))?
             .agent_pid_ns = own_pid_ns;
+        if !kernel_has("p9_client_rpc") {
+            open_skel.progs.p9_client_rpc_kretprobe.set_autoload(false);
+            tracing::info!("no 9p client in this kernel: 9p traffic is not counted");
+        }
         let mut skel = open_skel.load().context("loading the BPF programs")?;
         check_layout(&skel.maps.process_stats_map, size_of::<RawProcessStats>())?;
         check_layout(&skel.maps.machine_stats_map, size_of::<RawMachineStats>())?;
@@ -118,6 +122,16 @@ impl<'a> BpfAgent<'a> {
     }
 }
 
+fn kernel_has(symbol: &str) -> bool {
+    std::fs::read_to_string("/proc/kallsyms").is_ok_and(|all| lists_symbol(&all, symbol))
+}
+
+fn lists_symbol(kallsyms: &str, symbol: &str) -> bool {
+    kallsyms
+        .lines()
+        .any(|line| line.split_whitespace().nth(2) == Some(symbol))
+}
+
 fn check_layout(map: &impl MapCore, value_size: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
         map.key_size() as usize == size_of::<u32>() && map.value_size() as usize == value_size,
@@ -172,6 +186,18 @@ fn kernel_version(release: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_symbol_is_found_by_its_whole_name_in_the_kernel_or_a_module() {
+        let kallsyms = "0000000000000000 T p9_client_rpc_extra\n\
+                        0000000000000000 t vfs_read\n\
+                        0000000000000000 T p9_client_rpc\t[9pnet]\n";
+        assert!(lists_symbol(kallsyms, "p9_client_rpc"));
+        assert!(lists_symbol(kallsyms, "vfs_read"));
+        assert!(!lists_symbol(kallsyms, "p9_client"));
+        assert!(!lists_symbol("0000000000000000 T p9_client_rpc_extra\n", "p9_client_rpc"));
+        assert!(kernel_has("vfs_read"));
+    }
 
     #[test]
     fn kernel_releases_parse_to_major_and_minor() {
